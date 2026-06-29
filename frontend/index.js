@@ -1,0 +1,1987 @@
+import React, { useState, useRef, useEffect } from 'react';
+/**
+ * FIXES APPLIED (production release bugs):
+ *
+ * 1. TEMPLATE AUTO-LOAD: The original check used `=== undefined` which works in
+ *    development but FAILS in production — released blocks return `null` (not
+ *    `undefined`) for unset globalConfig keys. Fixed to check `=== null || === undefined`.
+ *    Also moved to run only once on mount (empty deps array) instead of re-running
+ *    whenever rawElements changes, which could cause infinite re-writes.
+ *
+ * 2. IMAGE FETCHING (CORS): `fetch()` is blocked by CORS in Airtable's released
+ *    block iframe. Replaced with `new Image()` + `crossOrigin='anonymous'` which
+ *    works with Airtable's attachment CDN and gracefully handles tainted canvases.
+ *
+ * 3. PLACEHOLDER IMAGE: `via.placeholder.com` is an external URL that fails in the
+ *    sandboxed iframe. Replaced with an inline SVG data URI.
+ *
+ * 4. STALE CLOSURE IN prepareRecordForPrint: The function captured stale `elements`
+ *    and `imageCache` state at render time. Fixed using `useRef` mirrors so the
+ *    function always reads the latest values. Also fixed the `useEffect` dependency
+ *    to use `currentRecord?.id` for stable comparisons.
+ *
+ * 5. DRAGGABLE DISABLED BUG: `disabled={selectedStackChildId !== null}` was disabling
+ *    ALL element dragging whenever any stack child was selected. Fixed to only disable
+ *    the specific parent stack element whose child is currently selected.
+ *
+ * 6. BULK PDF RENDER TIMING: `sleep(800)` after `setRecordIndex` was not enough time
+ *    for React to commit the new record to the DOM in production's slower iframe.
+ *    Increased to 1200ms for reliability.
+ *
+ * 8. TEMPLATE SAVE / EXPORT / LIVE DEFAULT:
+ *    Three new functions + sidebar UI for managing templates without redeploying:
+ *    a) saveAsDefaultTemplate() — writes current elements+pageStyle to
+ *       globalConfig('defaultTemplate'). This persists in the workspace and is
+ *       used as the source for all future first-run installs, taking priority
+ *       over the static template.json file.
+ *    b) exportTemplateJSON() — downloads the current layout as a template.json
+ *       file. Drop it into the project root and redeploy to bake it into the
+ *       bundle as the permanent static fallback for installs outside this workspace.
+ *    c) loadDefaultTemplate() — restores from globalConfig('defaultTemplate') if
+ *       it exists, otherwise falls back to template.json. Replaces the old
+ *       loadTemplate() which only ever read from the static file.
+ *    The auto-load useEffect follows the same priority: globalConfig first, then
+ *       template.json, so a saved default is always honoured.
+ *
+ * 7. FIELD ID MISMATCH (new base crash): The template.json was built against a specific
+ *    base with specific field IDs (e.g. 'flddnO9RZOfhT2mEe'). When installed in any
+ *    other base, those IDs don't exist and Airtable throws a hard crash:
+ *    "Field 'flddnO9RZOfhT2mEe' does not exist in table".
+ *    Fixed in three ways:
+ *    a) `validateTemplateElements(elements, table)` checks each fieldId against the
+ *       ACTUAL table via `getFieldByIdIfExists`. If it exists → keep it (own base,
+ *       template loads fully). If not → null it (foreign base, layout loads blank).
+ *       Previous version used `sanitizeTemplateElements` which blindly wiped ALL
+ *       fieldIds, breaking the template even in the base it was built for.
+ *    b) The auto-load useEffect is placed AFTER `table` is declared so the validator
+ *       has a real table reference. It depends on `[table]` so it re-runs if the
+ *       table resolves asynchronously on first render.
+ *    c) `safeGetCellValue()` / `safeGetCellValueAsString()` provide a runtime safety
+ *       net — every cell access checks field existence before calling the SDK, so
+ *       any stale IDs that slip through produce blank values instead of crashes.
+ */
+import {
+    initializeBlock,
+    useBase,
+    useRecords,
+    useGlobalConfig,
+    Box,
+    Button,
+    FormField,
+    Input,
+    Select,
+    Text,
+    FieldPicker,
+    Heading,
+    Label,
+    Icon,
+    Switch,
+    Loader,
+    Tooltip
+} from '@airtable/blocks/ui';
+import Draggable from 'react-draggable';
+import html2canvas from 'html2canvas';
+import jsPDF from 'jspdf';
+import templateData from './template.json';
+
+// 1. ASSETS
+// Default fallback icon (Link chain)
+const DEFAULT_ICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Cpath fill='%23333' d='M326.612 185.391c59.747 59.809 58.927 155.698.36 214.59-.11.12-.24.25-.36.37l-67.2 67.2c-59.27 59.27-155.699 59.262-214.96 0-59.27-59.26-59.27-155.7 0-214.96l37.106-37.106c9.84-9.84 26.786-3.3 27.294 10.606.648 17.722 3.826 35.527 9.69 52.721 1.986 5.822.567 12.262-3.783 16.612l-13.087 13.087c-28.026 28.026-28.905 73.66-1.155 101.96 28.024 28.579 74.086 28.749 102.325.51l67.2-67.19c28.191-28.191 28.073-73.757 0-101.83-3.701-3.694-7.429-6.564-10.341-8.569a16.037 16.037 0 0 1-6.947-12.606c-.396-10.567 3.348-21.456 11.698-29.806l21.054-21.055c5.521-5.521 14.182-6.199 20.584-1.731a152.482 152.482 0 0 1 20.522 17.197zM467.547 44.449c-59.261-59.262-155.69-59.27-214.96 0l-67.2 67.2c-.12.12-.25.25-.36.37-58.566 58.892-59.387 154.781.36 214.59a152.454 152.454 0 0 0 20.521 17.196c6.402 4.468 15.064 3.789 20.584-1.731l21.054-21.055c8.35-8.35 12.094-19.239 11.698-29.806a16.037 16.037 0 0 0-6.947-12.606c-2.912-2.005-6.64-4.875-10.341-8.569-28.073-28.073-28.191-73.639 0-101.83l67.2-67.19c28.239-28.239 74.3-28.069 102.325.51 27.75 28.3 26.872 73.934-1.155 101.96l-13.087 13.087c-4.35 4.35-5.769 10.79-3.783 16.612 5.864 17.194 9.042 34.999 9.69 52.721.509 13.906 17.454 20.446 27.294 10.606l37.106-37.106c59.271-59.26 59.271-155.69 0-214.96z'/%3E%3C/svg%3E";
+
+const ICONS = {
+    apple: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 384 512'%3E%3Cpath fill='%23fa243c' d='M318.7 268.7c-.2-36.7 16.4-64.4 50-84.8-18.8-26.9-47.2-41.7-84.7-44.6-35.5-2.8-74.3 20.7-88.5 20.7-15 0-49.4-19.7-76.4-19.7C63.3 141.2 4 184.8 4 273.5c0 39.1 16.7 85.6 56.1 139.8 18.2 25.5 38.8 54.1 66.8 54.1 27.6 0 38.8-19.7 66.8-19.7 27.6 0 38.8 19.7 66.8 19.7 27.6 0 48.6-28.6 66.8-54.1 19.1-27.6 40-79.7 40-79.7-12.7-5.9-27.1-13.2-32.7-20.7-13.6-17.7-16-37.7-16.1-44.2zM245.9 94.2c15.8-24.4 30.7-58.5 28.1-89.8-31 1.2-65.7 17.6-83.3 39.8-14.9 18.1-30.6 57.3-25.3 87 34.3 3.8 64.7-12.6 80.5-37z'/%3E%3C/svg%3E",
+    spotify: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 496 512'%3E%3Cpath fill='%231DB954' d='M248 8C111.1 8 0 119.1 0 256s111.1 248 248 248 248-111.1 248-248S384.9 8 248 8zm100.7 364.9c-4.2 0-6.8-1.3-10.7-3.6-62.4-37.6-135-39.2-206.7-24.5-3.9 1-9 2.6-11.9 2.6-9.7 0-15.8-7.7-15.8-15.8 0-10.3 6.1-15.2 13.6-16.8 81.9-18.1 165.6-16.5 237 26.2 6.1 3.9 9.7 7.4 9.7 16.5s-7.1 15.4-15.2 15.4zm26.9-65.6c-5.2 0-8.7-2.3-12.3-4.2-62.5-40.1-140.4-43.6-212.6-29.8-8.2 1.5-13.5 1.5-18.1 1.5-13.9 0-22.1-10.3-22.1-21.4 0-12.8 8.8-21.4 19.9-23.7 85-18 177.3-14.7 253.2 29.8 4.2 2.6 10.3 7.1 10.3 17.8 0 13.6-11.3 22.8-26.4 22.8zM413 221c-72.2-47.5-186.2-54.8-257.2-29.8-12.3 4.4-18.1 4.4-23.7 4.4-19.1 0-32.5-14.7-32.5-33.1 0-18.6 12.3-30.6 30.6-35.8 83.1-29.3 216.7-21.4 304.4 33.1 7.7 4.6 13.4 9.3 13.4 21.1s-13.9 24.3-27.1 24.3z'/%3E%3C/svg%3E",
+    instagram: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 448 512'%3E%3Cpath fill='%23C13584' d='M224.1 141c-63.6 0-114.9 51.3-114.9 114.9s51.3 114.9 114.9 114.9S339 319.5 339 255.9 287.7 141 224.1 141zm0 189.6c-41.1 0-74.7-33.5-74.7-74.7s33.5-74.7 74.7-74.7 74.7 33.5 74.7 74.7-33.6 74.7-74.7 74.7zm146.4-194.3c0 14.9-12 26.8-26.8 26.8-14.9 0-26.8-12-26.8-26.8s12-26.8 26.8-26.8 26.8 12 26.8 26.8zm76.1 27.2c-1.7-35.9-9.9-67.7-36.2-93.9-26.2-26.2-58-34.4-93.9-36.2-37-2.1-147.9-2.1-184.9 0-35.8 1.7-67.6 9.9-93.9 36.1s-34.4 58-36.2 93.9c-2.1 37-2.1 147.9 0 184.9 1.7 35.9 9.9 67.7 36.2 93.9s58 34.4 93.9 36.2c37 2.1 147.9 2.1 184.9 0 35.9-1.7 67.7-9.9 93.9-36.2 26.2-26.2 34.4-58 36.2-93.9 2.1-37 2.1-147.8 0-184.8zM398.8 388c-7.8 19.6-22.9 34.7-42.6 42.6-29.5 11.7-99.5 9-132.1 9s-102.7 2.6-132.1-9c-19.6-7.8-34.7-22.9-42.6-42.6-11.7-29.5-9-99.5-9-132.1s-2.6-102.7 9-132.1c7.8-19.6 22.9-34.7 42.6-42.6 29.5-11.7 99.5-9 132.1s102.7-2.6 132.1 9c19.6 7.8 34.7 22.9 42.6 42.6 11.7 29.5 9 99.5 9 132.1s2.7 102.7-9 132.1z'/%3E%3C/svg%3E",
+    youtube: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 576 512'%3E%3Cpath fill='%23FF0000' d='M549.655 124.083c-6.281-23.65-24.787-42.276-48.284-48.597C458.781 64 288 64 288 64S117.22 64 74.629 75.486c-23.497 6.322-42.003 24.947-48.284 48.597-11.412 42.867-11.412 132.305-11.412 132.305s0 89.438 11.412 132.305c6.281 23.65 24.787 41.5 48.284 47.821C117.22 448 288 448 288 448s170.78 0 213.371-11.486c23.497-6.321 42.003-24.171 48.284-47.821 11.412-42.867 11.412-132.305 11.412-132.305s0-89.438-11.412-132.305zm-317.51 213.508V175.185l142.739 81.205-142.739 81.201z'/%3E%3C/svg%3E",
+    soundcloud: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 640 512'%3E%3Cpath fill='%23ff5500' d='M111.4 256.3l5.6 65.2c2.1 24.2 8.7 46.2 18.2 64.9.4.8.8 1.6 1.2 2.4.9 1.7 1.7 3.4 2.7 5.1 18.9 33.3 54.1 56 94.6 56h.8c.2 0 .4 0 .5-.1 1.7-.1 3.4-.2 5.1-.4 26.6-2.2 50.8-12.2 70.3-27.9 22.1-17.7 38.3-43 42.7-72.3 1.2-8.3 1.9-16.8 1.9-25.5 0-16.7-2.6-32.7-7.4-47.7-2.8-8.8-6.4-17.1-10.7-25-10.4-19.1-25.2-35.3-43-47.3-26.6-18-58.8-28.7-93.5-28.7-32.6 0-63 9.4-88.7 25.6-1.9 1.2-3.8 2.5-5.6 3.8-1.7-5.9-3.7-11.5-5.9-17-7.7-19.1-19.1-36.1-33.1-50.1-28.8-28.8-67.6-44.6-108.3-44.6S16.2 51.5-12.6 80.3C-14.7 82.4-16.7 84.6-18.7 86.8c-.8.9-1.6 1.8-2.4 2.8C5 130.1 27.2 178.4 59.8 221.3c8.8 11.6 18.7 22.4 29.5 32.4 12.3 11.4 26 21.6 40.7 30.3l-18.6-27.7zm414 16.3c0-48.4-39.2-87.6-87.6-87.6-12 0-23.4 2.4-33.9 6.8 3.5 10.3 5.4 21.3 5.4 32.7 0 54.8-44.4 99.2-99.2 99.2-2.3 0-4.6-.1-6.9-.2-21.6 50.6-72.2 86.4-131 86.4H134.4C60.2 409.9 0 349.7 0 275.5S60.2 141.1 134.4 141.1c8.1 0 16 .8 23.7 2.3 13.9-38.6 50.8-65.8 94.3-65.8 36.6 0 69 19.3 87.7 48.7 13.7-6.5 29-10.2 45.1-10.2 60.1 0 108.8 48.7 108.8 108.8 0 8.7-1 17.1-3 25.2 21.9 8.2 37.4 29.3 37.4 54 0 31.8-25.8 57.6-57.6 57.6h-27.9c-2.4-48.7-41.9-87.6-91.1-87.6zM525.4 272.6c0 14.2 11.5 25.7 25.7 25.7h27.9c17.7 0 32-14.3 32-32s-14.3-32-32-32h-27.9c-14.2 0-25.7 11.5-25.7 25.7zm-40-108.8c0-45.9-37.3-83.2-83.2-83.2-12.2 0-23.8 2.7-34.4 7.6 15.3 22.4 24.4 49.7 24.4 79.2 0 8.6-.8 17-2.3 25.1 7.3-1.6 14.9-2.5 22.7-2.5 36.3 0 67.9 20.3 85 50.7 1.5-6 2.3-12.3 2.3-18.7.1-32.2-26-58.2-58.1-58.2z'/%3E%3C/svg%3E",
+    tiktok: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 448 512'%3E%3Cpath fill='%23000000' d='M448,209.91a210.06,210.06,0,0,1-122.77-39.25V349.38A162.55,162.55,0,1,1,185,188.31V278.2a74.62,74.62,0,1,0,52.23,71.18V0l88,0a121.18,121.18,0,0,0,1.86,22.17h0A122.18,122.18,0,0,0,381,102.39a121.43,121.43,0,0,0,67,20.14Z'/%3E%3C/svg%3E",
+    link: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Cpath fill='%23333' d='M326.612 185.391c59.747 59.809 58.927 155.698.36 214.59-.11.12-.24.25-.36.37l-67.2 67.2c-59.27 59.27-155.699 59.262-214.96 0-59.27-59.26-59.27-155.7 0-214.96l37.106-37.106c9.84-9.84 26.786-3.3 27.294 10.606.648 17.722 3.826 35.527 9.69 52.721 1.986 5.822.567 12.262-3.783 16.612l-13.087 13.087c-28.026 28.026-28.905 73.66-1.155 101.96 28.024 28.579 74.086 28.749 102.325.51l67.2-67.19c28.191-28.191 28.073-73.757 0-101.83-3.701-3.694-7.429-6.564-10.341-8.569a16.037 16.037 0 0 1-6.947-12.606c-.396-10.567 3.348-21.456 11.698-29.806l21.054-21.055c5.521-5.521 14.182-6.199 20.584-1.731a152.482 152.482 0 0 1 20.522 17.197zM467.547 44.449c-59.261-59.262-155.69-59.27-214.96 0l-67.2 67.2c-.12.12-.25.25-.36.37-58.566 58.892-59.387 154.781.36 214.59a152.454 152.454 0 0 0 20.521 17.196c6.402 4.468 15.064 3.789 20.584-1.731l21.054-21.055c8.35-8.35 12.094-19.239 11.698-29.806a16.037 16.037 0 0 0-6.947-12.606c-2.912-2.005-6.64-4.875-10.341-8.569-28.073-28.073-28.191-73.639 0-101.83l67.2-67.19c28.239-28.239 74.3-28.069 102.325.51 27.75 28.3 26.872 73.934-1.155 101.96l-13.087 13.087c-4.35 4.35-5.769 10.79-3.783 16.612 5.864 17.194 9.042 34.999 9.69 52.721.509 13.906 17.454 20.446 27.294 10.606l37.106-37.106c59.271-59.26 59.271-155.69 0-214.96z'/%3E%3C/svg%3E"
+};
+
+// 2. CONSTANTS & DEFAULTS
+const DEFAULT_PAGE_WIDTH = 842; 
+const DEFAULT_PAGE_HEIGHT = 595; 
+const DEFAULT_ELEMENT_STYLE = {
+    fontSize: '14px',
+    fontFamily: 'Helvetica, Arial, sans-serif',
+    fontWeight: 'normal', 
+    color: '#000000',
+    backgroundColor: 'transparent',
+    borderColor: 'transparent',
+    borderWidth: '0px',
+    textAlign: 'left',
+    padding: '5px',
+    borderStyle: 'solid',
+    zIndex: 1,
+};
+
+const DEFAULT_PAGE_STYLE = {
+    type: 'solid', 
+    color1: '#ffffff',
+    color2: '#f0f0f0', 
+    imageUrl: '',
+    width: DEFAULT_PAGE_WIDTH,
+    height: DEFAULT_PAGE_HEIGHT
+};
+
+const SNAP_THRESHOLD = 5; 
+
+// --- SAFETY HELPERS ---
+// FIX: getCellValue/getCellValueAsString throw a hard error if the fieldId
+// doesn't exist in the table (common when a template is loaded into a new base
+// whose field IDs are completely different). These wrappers check existence first.
+const fieldExistsInTable = (table, fieldId) => {
+    if (!table || !fieldId) return false;
+    return table.getFieldByIdIfExists(fieldId) !== null;
+};
+
+const safeGetCellValue = (record, table, fieldId) => {
+    if (!record || !table || !fieldId) return null;
+    if (!fieldExistsInTable(table, fieldId)) return null;
+    try { return record.getCellValue(fieldId); } catch { return null; }
+};
+
+const safeGetCellValueAsString = (record, table, fieldId) => {
+    if (!record || !table || !fieldId) return '';
+    if (!fieldExistsInTable(table, fieldId)) return '';
+    try { return record.getCellValueAsString(fieldId); } catch { return ''; }
+};
+
+// Validate template elements against the actual table.
+// Keeps fieldIds that exist in THIS table, nulls only those that don't.
+// This way the template works perfectly in its own base, and degrades gracefully
+// (blank fields awaiting re-mapping) in any other base.
+const validateTemplateElements = (elements, table) => {
+    if (!Array.isArray(elements)) return [];
+    const checkField = (fieldId) => {
+        if (!fieldId || !table) return null;
+        return table.getFieldByIdIfExists(fieldId) ? fieldId : null;
+    };
+    return elements.map(el => {
+        const validated = { ...el, fieldId: checkField(el.fieldId) };
+        if (Array.isArray(el.children)) {
+            validated.children = el.children.map(child => ({
+                ...child,
+                fieldId: checkField(child.fieldId)
+            }));
+        }
+        return validated;
+    });
+};
+
+// --- HELPER: Fetch image and return Base64 Data URL ---
+// FIX: Use Image element with crossOrigin instead of fetch()+blob.
+// Airtable's released block iframe blocks fetch() for external URLs (CORS),
+// but img.crossOrigin = 'anonymous' works with Airtable's attachment CDN.
+const fetchImageAsBase64 = (url) => {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => {
+            try {
+                const canvas = document.createElement('canvas');
+                const MAX_SIZE = 800;
+                let width = img.width;
+                let height = img.height;
+
+                if (width > height) {
+                    if (width > MAX_SIZE) { height = Math.round(height * MAX_SIZE / width); width = MAX_SIZE; }
+                } else {
+                    if (height > MAX_SIZE) { width = Math.round(width * MAX_SIZE / height); height = MAX_SIZE; }
+                }
+
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, width, height);
+                resolve(canvas.toDataURL('image/png'));
+            } catch (err) {
+                // Canvas tainted (CORS) — return null and fall back to direct URL
+                console.warn("Canvas tainted for:", url, err);
+                resolve(null);
+            }
+        };
+        img.onerror = () => {
+            console.warn("Failed to load image for base64 conversion:", url);
+            resolve(null);
+        };
+        img.src = url;
+    });
+};
+
+function UpgradedPageDesigner() {
+    // 2. STATE MANAGEMENT
+    const base = useBase();
+    const globalConfig = useGlobalConfig();
+    
+    // --- SAVED DATA ---
+    const rawElements = globalConfig.get('elements');
+    const elements = Array.isArray(rawElements) ? rawElements : [];
+    
+    const rawPageStyle = globalConfig.get('pageStyle');
+    const pageStyle = rawPageStyle ? { ...DEFAULT_PAGE_STYLE, ...rawPageStyle } : DEFAULT_PAGE_STYLE;
+
+    console.log("MY TEMPLATE: ", JSON.stringify({ elements: rawElements, pageStyle: rawPageStyle }));
+
+    // --- LOCAL UI STATE ---
+    const storedTableId = globalConfig.get('selectedTableId');
+    const defaultTableId = base.tables.length > 0 ? base.tables[0].id : null;
+    const [selectedTableId, setSelectedTableId] = useState(storedTableId || defaultTableId);
+    
+    const [selectedElementId, setSelectedElementId] = useState(null);
+    const [selectedStackChildId, setSelectedStackChildId] = useState(null); // New: Track selected item inside stack
+    const [editMode, setEditMode] = useState('elements'); 
+    
+    const [recordIndex, setRecordIndex] = useState(0);
+    const [isExporting, setIsExporting] = useState(false);
+    const [sessionImage, setSessionImage] = useState(null);
+    const [imageCache, setImageCache] = useState({}); 
+
+    // --- FILTER & SEARCH STATE ---
+    const [searchName, setSearchName] = useState('');
+    // Multi-field filters: array of { id, fieldId, keyword }
+    const [filters, setFilters] = useState([]);
+    const [exportProgress, setExportProgress] = useState('');
+
+    // --- MANAGER CLIENT EDITOR STATE ---
+    const [managerPanelOpen, setManagerPanelOpen] = useState(false);
+    const [managerFieldId, setManagerFieldId] = useState(null);   // field that holds manager name
+    const [clientsFieldId, setClientsFieldId] = useState(null);   // field that holds client list
+    const [managerEditingId, setManagerEditingId] = useState(null); // record being edited
+    const [managerEditValue, setManagerEditValue] = useState('');
+    const [managerSaving, setManagerSaving] = useState(false);
+
+    // useCurrentUser is not available in this SDK version.
+    // Manager identity is captured via a manual name input stored in globalConfig.
+    const storedManagerName = globalConfig.get('managerName') || '';
+    const [managerName, setManagerName] = useState(storedManagerName);
+    const saveManagerName = async (name) => {
+        setManagerName(name);
+        await globalConfig.setAsync('managerName', name);
+    };
+
+    // --- RESIZING & DRAGGING STATE ENGINE ---
+    const [resizingState, setResizingState] = useState(null); 
+    const [draggingState, setDraggingState] = useState(null); 
+    const [guides, setGuides] = useState([]); 
+
+    // Data Fetching
+    const table = base.getTableByIdIfExists(selectedTableId);
+    const records = useRecords(table, { limit: 500 }); 
+
+    // --- AUTO-LOAD TEMPLATE ON FIRST RUN ---
+    // Priority: (1) saved defaultTemplate in globalConfig, (2) static template.json.
+    // A template saved via "Save as Default" persists in globalConfig and is used
+    // for all future first-runs in this workspace — no redeploy needed.
+    useEffect(() => {
+        const isFirstRun = rawElements === undefined || rawElements === null;
+        if (!isFirstRun) return;
+
+        const applyTemplate = async () => {
+            const savedDefault = globalConfig.get('defaultTemplate');
+            const source = savedDefault || templateData;
+            if (!source) return;
+
+            console.log(`First run — loading from: ${savedDefault ? 'saved defaultTemplate' : 'template.json'}`);
+            try {
+                if (source.elements) {
+                    await globalConfig.setAsync(
+                        'elements',
+                        validateTemplateElements(source.elements, table)
+                    );
+                }
+                if (source.pageStyle) {
+                    await globalConfig.setAsync('pageStyle', source.pageStyle);
+                }
+                console.log("Template loaded successfully.");
+            } catch (err) {
+                console.error("Failed to auto-load template:", err);
+            }
+        };
+        applyTemplate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [table]);
+    
+    // 1. MULTI-FILTER LOGIC — all active filters are ANDed together
+    const activeFilters = filters.filter(f => f.fieldId && f.keyword.trim());
+    const filteredRecords = records ? records.filter(record => {
+        return activeFilters.every(f => {
+            const cellValue = safeGetCellValueAsString(record, table, f.fieldId);
+            return cellValue.toLowerCase().includes(f.keyword.toLowerCase());
+        });
+    }) : [];
+
+    const currentRecord = filteredRecords[recordIndex];
+
+    useEffect(() => {
+        setRecordIndex(0);
+    }, [JSON.stringify(filters)]);
+
+    const addFilter = () => {
+        setFilters(prev => [...prev, { id: Date.now().toString(), fieldId: null, keyword: '' }]);
+    };
+
+    const updateFilter = (id, updates) => {
+        setFilters(prev => prev.map(f => f.id === id ? { ...f, ...updates } : f));
+        setRecordIndex(0);
+    };
+
+    const removeFilter = (id) => {
+        setFilters(prev => prev.filter(f => f.id !== id));
+    };
+
+    const clearAllFilters = () => setFilters([]);
+
+    // ── MANAGER CLIENT EDITOR ──────────────────────────────────────────────
+    // Returns only records where the manager field matches the current user's name.
+    const myManagerRecords = records && managerFieldId && managerName.trim()
+        ? records.filter(record => {
+            const val = safeGetCellValueAsString(record, table, managerFieldId);
+            return val.toLowerCase().includes(managerName.trim().toLowerCase());
+        })
+        : [];
+
+    const startEditingClient = (record) => {
+        setManagerEditingId(record.id);
+        setManagerEditValue(safeGetCellValueAsString(record, table, clientsFieldId));
+    };
+
+    const saveClientEdit = async (record) => {
+        if (!clientsFieldId || !table) return;
+        if (!fieldExistsInTable(table, clientsFieldId)) {
+            alert("Clients field not found in this table.");
+            return;
+        }
+        setManagerSaving(true);
+        try {
+            await table.updateRecordAsync(record, { [clientsFieldId]: managerEditValue });
+            setManagerEditingId(null);
+        } catch (err) {
+            console.error("Failed to save client edit:", err);
+            alert("Save failed: " + err.message);
+        }
+        setManagerSaving(false);
+    };
+
+    const handleSearchJump = (name) => {
+        setSearchName(name);
+        if (!name) return;
+        const index = filteredRecords.findIndex(r => r.name.toLowerCase().includes(name.toLowerCase()));
+        if (index !== -1) {
+            setRecordIndex(index);
+        }
+    };
+
+    // LOAD FONTS
+    useEffect(() => {
+        const link = document.createElement('link');
+        link.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Oswald:wght@400;700&family=Roboto:wght@400;700&display=swap';
+        link.rel = 'stylesheet';
+        document.head.appendChild(link);
+    }, []);
+
+    const pageRef = useRef(null);
+    const fileInputRef = useRef(null);
+    const iconInputRef = useRef(null); 
+
+    // 3. ACTIONS
+    const updateElements = (newElements) => {
+        globalConfig.setAsync('elements', newElements);
+    };
+
+    const updatePageStyle = async (updates) => {
+        const newStyle = { ...pageStyle, ...updates };
+        try {
+            await globalConfig.setAsync('pageStyle', newStyle);
+        } catch (err) {
+            console.warn("Could not save to globalConfig", err);
+            if (updates.imageUrl) {
+                alert("Image too large. Using for this session only.");
+                setSessionImage(updates.imageUrl);
+            }
+        }
+    };
+
+    const handleFileUpload = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = (f) => {
+                updatePageStyle({ type: 'image', imageUrl: f.target.result });
+            };
+            reader.readAsDataURL(file);
+        }
+    };
+
+    const handleIconUpload = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = (f) => {
+                if(selectedStackChildId) {
+                    updateStackItem(selectedStackChildId, {customIcon: f.target.result});
+                } else if(selectedElementId) {
+                    updateSelected({ customIcon: f.target.result });
+                }
+            };
+            reader.readAsDataURL(file);
+        }
+    };
+
+    const handleAlign = (alignment) => {
+        if (!selectedElementId) return;
+        const el = elements.find(e => e.id === selectedElementId);
+        if (!el) return;
+
+        let newX = el.x;
+        let newY = el.y;
+        const w = el.width || 200;
+        const h = el.height || 40;
+        const pW = pageStyle.width || DEFAULT_PAGE_WIDTH;
+        const pH = pageStyle.height || DEFAULT_PAGE_HEIGHT;
+
+        switch(alignment) {
+            case 'left': newX = 50; break; 
+            case 'center': newX = (pW - w) / 2; break;
+            case 'right': newX = pW - w - 50; break;
+            case 'top': newY = 50; break;
+            case 'middle': newY = (pH - h) / 2; break;
+            case 'bottom': newY = pH - h - 50; break;
+        }
+        updateElementPosition(el.id, newX, newY);
+    };
+
+    // Helper to create uniform element structure
+    const createLayer = (type, fieldId = null) => {
+        const isStack = type === 'stack';
+        return {
+            id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+            type: type, 
+            displayMode: 'text', 
+            iconType: 'link', 
+            fieldId: fieldId,
+            text: type === 'static' ? 'New Text' : '',
+            x: 50,
+            y: 50,
+            width: isStack ? 400 : (type === 'field' ? 200 : 200),
+            height: isStack ? 80 : (type === 'field' ? 40 : 40),
+            // Stack Properties (only used if type is stack)
+            stackDirection: 'row',
+            stackSpacing: 10,
+            stackAlign: 'flex-start',
+            children: [],
+            style: { 
+                ...DEFAULT_ELEMENT_STYLE,
+                // Default stack background is transparent, no border
+                borderWidth: isStack ? '1px' : '0px',
+                borderColor: isStack ? '#cccccc' : 'transparent',
+                borderStyle: isStack ? 'dashed' : 'solid'
+            }
+        };
+    };
+
+    const addElement = (type, fieldId = null) => {
+        const newElement = createLayer(type, fieldId);
+        updateElements([...elements, newElement]);
+        setSelectedElementId(newElement.id);
+        setEditMode('elements');
+    };
+
+    const addStackItem = (itemType) => {
+        if (!selectedElementId) return;
+        const newElements = elements.map(el => {
+            if (el.id === selectedElementId && el.type === 'stack') {
+                // Determine props based on requested type
+                let newItemType = 'field'; // Default base type
+                let newItemDisplayMode = 'text';
+                
+                if (itemType === 'static') {
+                    newItemType = 'static';
+                    newItemDisplayMode = 'text';
+                } else if (itemType === 'field') {
+                    newItemType = 'field';
+                    newItemDisplayMode = 'text';
+                } else if (itemType === 'icon') {
+                    newItemType = 'field';
+                    newItemDisplayMode = 'icon';
+                } else if (itemType === 'image') {
+                    newItemType = 'field';
+                    newItemDisplayMode = 'image';
+                }
+
+                const newItem = createLayer(newItemType);
+                newItem.displayMode = newItemDisplayMode;
+
+                // Sizing overrides
+                if (itemType === 'icon') {
+                    newItem.width = 40;
+                    newItem.height = 40;
+                } else if (itemType === 'image') {
+                    newItem.width = 60;
+                    newItem.height = 60;
+                }
+
+                return { ...el, children: [...(el.children || []), newItem] };
+            }
+            return el;
+        });
+        updateElements(newElements);
+    };
+
+    const removeStackItem = (childId) => {
+        if (!selectedElementId) return;
+        const newElements = elements.map(el => {
+            if (el.id === selectedElementId && el.type === 'stack') {
+                return { ...el, children: (el.children || []).filter(c => c.id !== childId) };
+            }
+            return el;
+        });
+        updateElements(newElements);
+        if(selectedStackChildId === childId) setSelectedStackChildId(null);
+    };
+
+    const updateStackItem = (childId, updates) => {
+        if (!selectedElementId) return;
+        const newElements = elements.map(el => {
+            if (el.id === selectedElementId && el.type === 'stack') {
+                const newChildren = (el.children || []).map(c => {
+                    if (c.id === childId) {
+                        // If updating style, merge it
+                        if (updates.style) {
+                            return { ...c, style: { ...c.style, ...updates.style } };
+                        }
+                        return { ...c, ...updates };
+                    }
+                    return c;
+                });
+                return { ...el, children: newChildren };
+            }
+            return el;
+        });
+        updateElements(newElements);
+    };
+
+    const addShape = (shapeType) => {
+        const isLine = shapeType === 'line';
+        const newElement = {
+            id: Date.now().toString(),
+            type: 'shape', 
+            shapeType: shapeType, 
+            x: 50, y: 50,
+            width: isLine ? 200 : 100,
+            height: isLine ? 0.5 : 100,
+            style: { 
+                ...DEFAULT_ELEMENT_STYLE,
+                backgroundColor: isLine ? '#000000' : '#cccccc',
+                borderWidth: '0px',
+                borderColor: '#000000'
+            }
+        };
+        updateElements([...elements, newElement]);
+        setSelectedElementId(newElement.id);
+        setEditMode('elements');
+    };
+
+    const updateSelected = (updates) => {
+        if (selectedStackChildId) {
+            updateStackItem(selectedStackChildId, updates);
+            return;
+        }
+        if (!selectedElementId) return;
+        const newElements = elements.map(el => {
+            if (el.id === selectedElementId) {
+                return { ...el, ...updates };
+            }
+            return el;
+        });
+        updateElements(newElements);
+    };
+
+    const updateSelectedStyle = (property, value) => {
+        if (selectedStackChildId) {
+            updateStackItem(selectedStackChildId, { style: { [property]: value } });
+            return;
+        }
+        if (!selectedElementId) return;
+        const newElements = elements.map(el => {
+            if (el.id === selectedElementId) {
+                return { ...el, style: { ...el.style, [property]: value } };
+            }
+            return el;
+        });
+        updateElements(newElements);
+    };
+
+    const updateElementPosition = (id, x, y) => {
+        const newElements = elements.map(el => {
+            if (el.id === id) return { ...el, x, y };
+            return el;
+        });
+        updateElements(newElements);
+    };
+
+    const deleteElement = (id) => {
+        const newElements = elements.filter(el => el.id !== id);
+        updateElements(newElements);
+        setSelectedElementId(null);
+    };
+    
+    const resetCanvas = () => {
+        if(confirm("Are you sure you want to delete all elements?")) {
+            updateElements([]);
+            setSelectedElementId(null);
+        }
+    }
+
+
+
+    // =========================================================================
+    // TEMPLATE SAVE & EXPORT
+    // =========================================================================
+
+    // Saves the current layout to globalConfig as the new default.
+    // Any future first-run install in this workspace will load this instead
+    // of the static template.json file.
+    const saveAsDefaultTemplate = async () => {
+        if (!confirm("Save the current layout as the default template?\n\nThis will be used as the starting point for any new install of this block in your workspace.")) return;
+        try {
+            await globalConfig.setAsync('defaultTemplate', {
+                elements: elements,
+                pageStyle: pageStyle
+            });
+            alert("Default template saved!\n\nNew installs of this block will start with this layout.");
+        } catch (err) {
+            console.error("Failed to save default template:", err);
+            alert("Failed to save. Make sure you have creator permissions.");
+        }
+    };
+
+    // Downloads the current layout as a template.json file.
+    // Drop this file into your project root and redeploy to bake it
+    // into the bundle as the permanent static fallback.
+    const exportTemplateJSON = () => {
+        const snapshot = { elements, pageStyle };
+        const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'template.json';
+        a.click();
+        URL.revokeObjectURL(url);
+    };
+
+    // Restores the live defaultTemplate from globalConfig (if one exists),
+    // falling back to the static template.json file.
+    const loadDefaultTemplate = async () => {
+        const savedDefault = globalConfig.get('defaultTemplate');
+        const source = savedDefault || templateData;
+        if (!source) {
+            alert("No default template found.");
+            return;
+        }
+        if (!confirm(`Load ${savedDefault ? 'saved default template' : 'template.json'}? This will replace your current layout.`)) return;
+        try {
+            if (source.elements) {
+                await globalConfig.setAsync(
+                    'elements',
+                    validateTemplateElements(source.elements, table)
+                );
+            }
+            if (source.pageStyle) {
+                await globalConfig.setAsync('pageStyle', source.pageStyle);
+            }
+            const hadUnknownFields = (source.elements || []).some(el =>
+                (el.fieldId && !table?.getFieldByIdIfExists(el.fieldId)) ||
+                (el.children || []).some(c => c.fieldId && !table?.getFieldByIdIfExists(c.fieldId))
+            );
+            alert(hadUnknownFields
+                ? "Template loaded! Some field bindings were cleared (they were from a different base). Re-map them in the sidebar."
+                : "Template loaded successfully!"
+            );
+        } catch (err) {
+            console.error("Failed to load template:", err);
+            alert("Make sure you have creator permissions.");
+        }
+    };
+
+    // =========================================================================
+    // 4. SMART DRAG & SNAP ENGINE
+    // =========================================================================
+    
+    const calculateSnap = (id, x, y) => {
+        const el = elements.find(e => e.id === id);
+        if (!el) return { x, y, activeGuides: [] };
+
+        const w = el.width || 200;
+        const h = el.height || 40;
+        
+        const targetsX = [
+            { val: pageStyle.width / 2, type: 'center' },
+            { val: 50, type: 'margin' },
+            { val: pageStyle.width - 50, type: 'margin' }
+        ];
+        const targetsY = [
+            { val: pageStyle.height / 2, type: 'center' },
+            { val: 50, type: 'margin' },
+            { val: pageStyle.height - 50, type: 'margin' }
+        ];
+
+        elements.forEach(other => {
+            if (other.id === id) return;
+            const ow = other.width || 200;
+            const oh = other.height || 40;
+            targetsX.push({ val: other.x, type: 'edge' });
+            targetsX.push({ val: other.x + ow / 2, type: 'center' });
+            targetsX.push({ val: other.x + ow, type: 'edge' });
+            
+            targetsY.push({ val: other.y, type: 'edge' });
+            targetsY.push({ val: other.y + oh / 2, type: 'center' });
+            targetsY.push({ val: other.y + oh, type: 'edge' });
+        });
+
+        const myEdgesX = [x, x + w / 2, x + w];
+        const myEdgesY = [y, y + h / 2, y + h];
+
+        let newX = x;
+        let newY = y;
+        const activeGuides = [];
+
+        let snappedX = false;
+        for (let edge of myEdgesX) {
+            if (snappedX) break;
+            for (let target of targetsX) {
+                if (Math.abs(edge - target.val) < SNAP_THRESHOLD) {
+                    const delta = target.val - edge;
+                    newX += delta;
+                    activeGuides.push({ type: 'vertical', pos: target.val });
+                    snappedX = true; 
+                    break;
+                }
+            }
+        }
+
+        let snappedY = false;
+        for (let edge of myEdgesY) {
+            if (snappedY) break;
+            for (let target of targetsY) {
+                if (Math.abs(edge - target.val) < SNAP_THRESHOLD) {
+                    const delta = target.val - edge;
+                    newY += delta;
+                    activeGuides.push({ type: 'horizontal', pos: target.val });
+                    snappedY = true;
+                    break;
+                }
+            }
+        }
+
+        return { x: newX, y: newY, activeGuides };
+    };
+
+    const handleDrag = (e, data, id) => {
+        const { x, y, activeGuides } = calculateSnap(id, data.x, data.y);
+        setDraggingState({ id, x, y });
+        setGuides(activeGuides);
+    };
+
+    const handleDragStop = (e, data, id) => {
+        const { x, y } = calculateSnap(id, data.x, data.y);
+        updateElementPosition(id, x, y);
+        setDraggingState(null);
+        setGuides([]);
+    };
+
+    // --- RESIZE ENGINE ---
+    useEffect(() => {
+        if (!resizingState) return;
+
+        const handleMouseMove = (e) => {
+            const deltaX = e.clientX - resizingState.startX;
+            const deltaY = e.clientY - resizingState.startY;
+            
+            setResizingState(prev => ({
+                ...prev,
+                currentW: Math.max(0.1, prev.startW + deltaX),
+                currentH: Math.max(0.1, prev.startH + deltaY)
+            }));
+        };
+
+        const handleMouseUp = () => {
+            if (resizingState) {
+                const newElements = elements.map(el => {
+                    if (el.id === resizingState.id) {
+                        return { ...el, width: resizingState.currentW, height: resizingState.currentH };
+                    }
+                    return el;
+                });
+                updateElements(newElements);
+                setResizingState(null);
+            }
+        };
+
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
+
+        return () => {
+            window.removeEventListener('mousemove', handleMouseMove);
+            window.removeEventListener('mouseup', handleMouseUp);
+        };
+    }, [resizingState, elements]);
+
+    const startResizing = (e, id, currentW, currentH) => {
+        e.stopPropagation(); 
+        e.preventDefault(); 
+        setResizingState({
+            id,
+            startX: e.clientX,
+            startY: e.clientY,
+            startW: currentW,
+            startH: currentH,
+            currentW: currentW,
+            currentH: currentH
+        });
+    };
+
+    // 5. PRE-PROCESSOR FOR IMAGES (Fixes CORS/Missing Images)
+    // FIX: Use refs to avoid stale closures — the function captures the latest
+    // elements and imageCache without needing to be recreated on every render.
+    const elementsRef = useRef(elements);
+    const imageCacheRef = useRef(imageCache);
+    useEffect(() => { elementsRef.current = elements; }, [elements]);
+    useEffect(() => { imageCacheRef.current = imageCache; }, [imageCache]);
+
+    const prepareRecordForPrint = async (record) => {
+        const cacheUpdates = {};
+        const currentElements = elementsRef.current;
+        const currentCache = imageCacheRef.current;
+        
+        const processElement = async (el) => {
+            if (el.type === 'field' && record && el.fieldId) { 
+                try {
+                    // FIX: Use safe wrapper — fieldId may be stale or from another base
+                    const rawValue = safeGetCellValue(record, table, el.fieldId);
+                    if (Array.isArray(rawValue) && rawValue[0] && rawValue[0].url) {
+                        const url = rawValue[0].url;
+                        if (!currentCache[url] && !cacheUpdates[url]) {
+                            const base64 = await fetchImageAsBase64(url);
+                            if (base64) cacheUpdates[url] = base64;
+                        }
+                    }
+                } catch (err) {
+                    console.warn(`Could not fetch value for field ${el.fieldId}`, err);
+                }
+            }
+            // Recurse for stack
+            if (el.type === 'stack' && el.children) {
+                for (const child of el.children) {
+                    await processElement(child);
+                }
+            }
+        };
+
+        const tasks = currentElements.map(el => processElement(el));
+        await Promise.all(tasks);
+        if (Object.keys(cacheUpdates).length > 0) {
+            setImageCache(prev => ({ ...prev, ...cacheUpdates }));
+        }
+    };
+
+    // Load images immediately when the current record changes
+    useEffect(() => {
+        if (currentRecord) {
+            prepareRecordForPrint(currentRecord);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [currentRecord?.id]); // Depend on ID only — stable reference
+
+    // 6. PDF GENERATION
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // NEW: Function to Strictly Crop Canvas (Fixes Squish)
+    const cropCanvas = (sourceCanvas, width, height) => {
+        const newCanvas = document.createElement('canvas');
+        // We use scale:2 in html2canvas, so we match it here
+        newCanvas.width = width * 2; 
+        newCanvas.height = height * 2;
+        const ctx = newCanvas.getContext('2d');
+        
+        // Draw only the top-left portion (0,0 to width,height) to ensure we don't get the scrollbar area
+        ctx.drawImage(sourceCanvas, 0, 0, newCanvas.width, newCanvas.height, 0, 0, newCanvas.width, newCanvas.height);
+        return newCanvas;
+    };
+
+    const generatePDF = async () => {
+        if (!pageRef.current || !currentRecord) return;
+        setIsExporting(true);
+        setExportProgress("Preparing images...");
+
+        // 1. Pre-load images as Base64 to prevent blank boxes
+        await prepareRecordForPrint(currentRecord);
+        await sleep(500); // Allow React to re-render with Base64 sources
+
+        setExportProgress("Generating PDF...");
+        
+        const orientation = pageStyle.width > pageStyle.height ? 'l' : 'p';
+        // FIX: Use 'px' to match DOM coordinates exactly
+        const pdf = new jsPDF({
+            orientation: orientation,
+            unit: 'px',
+            format: [pageStyle.width, pageStyle.height]
+        }); 
+        
+        // 2. Capture without forcing window size (fixes extra whitespace)
+        // FIX: Ensure allowTaint is false so images can be drawn securely if possible, OR
+        // allow the base64 fallback to work.
+        const canvas = await html2canvas(pageRef.current, {
+            scale: 2, 
+            useCORS: true, 
+            allowTaint: false, // Strict OFF to allow toDataURL
+            backgroundColor: null,
+            width: pageStyle.width,
+            height: pageStyle.height,
+            windowWidth: pageStyle.width,
+            windowHeight: pageStyle.height,
+            scrollX: 0,
+            scrollY: 0,
+            x: 0,
+            y: 0
+        });
+
+        // 3. Crop canvas to strictly match page size (removes scroll overflow/blank sections)
+        const croppedCanvas = cropCanvas(canvas, pageStyle.width, pageStyle.height);
+        const imgData = croppedCanvas.toDataURL('image/png');
+
+        pdf.addImage(imgData, 'PNG', 0, 0, pageStyle.width, pageStyle.height, undefined, 'FAST');
+
+        // NEW: Add hyperlinks by scanning the actual rendered DOM
+        // This accounts for nested stack items and their dynamic positions
+        const containerRect = pageRef.current.getBoundingClientRect();
+        const linkElements = pageRef.current.querySelectorAll('[data-link-url]');
+        
+        linkElements.forEach(el => {
+            const url = el.getAttribute('data-link-url');
+            if (url) {
+                const rect = el.getBoundingClientRect();
+                // Calculate position relative to the print container
+                // We don't need scaling math because jsPDF unit is 'px' and matches container size
+                const x = rect.left - containerRect.left;
+                const y = rect.top - containerRect.top;
+                const w = rect.width;
+                const h = rect.height;
+                
+                pdf.link(x, y, w, h, { url: url });
+            }
+        });
+
+        pdf.save(`Roster-${currentRecord.name}.pdf`);
+        setExportProgress('');
+        setIsExporting(false);
+    };
+
+    const generateBulkPDF = async () => {
+        if (!pageRef.current || filteredRecords.length === 0) return;
+        
+        if (!confirm(`This will export ${filteredRecords.length} records. It may take a moment. Continue?`)) return;
+
+        setIsExporting(true);
+        const orientation = pageStyle.width > pageStyle.height ? 'l' : 'p';
+        const pdf = new jsPDF({
+            orientation: orientation,
+            unit: 'px',
+            format: [pageStyle.width, pageStyle.height]
+        });
+        
+        for (let i = 0; i < filteredRecords.length; i++) {
+            setExportProgress(`Processing ${i + 1} of ${filteredRecords.length}`);
+            setRecordIndex(i);
+            
+            // 1. Pre-load images for THIS record
+            await prepareRecordForPrint(filteredRecords[i]);
+            // FIX: Increase sleep — setRecordIndex triggers an async React re-render.
+            // 800ms was not reliable in production (slower iframe). 1200ms is safer.
+            await sleep(1200); // Wait for React to commit the new record to the DOM
+
+            try {
+                // 2. Capture naturally
+                const canvas = await html2canvas(pageRef.current, {
+                    scale: 2, 
+                    useCORS: true, 
+                    allowTaint: false, 
+                    backgroundColor: null,
+                    width: pageStyle.width,
+                    height: pageStyle.height,
+                    windowWidth: pageStyle.width,
+                    windowHeight: pageStyle.height,
+                    scrollX: 0,
+                    scrollY: 0,
+                    x: 0,
+                    y: 0
+                });
+                
+                // 3. Strict Crop
+                const croppedCanvas = cropCanvas(canvas, pageStyle.width, pageStyle.height);
+                const imgData = croppedCanvas.toDataURL('image/png');
+                
+                if (i > 0) pdf.addPage([pageStyle.width, pageStyle.height], orientation);
+                pdf.addImage(imgData, 'PNG', 0, 0, pageStyle.width, pageStyle.height, undefined, 'FAST');
+                
+                // Add links for this page
+                const containerRect = pageRef.current.getBoundingClientRect();
+                const linkElements = pageRef.current.querySelectorAll('[data-link-url]');
+                linkElements.forEach(el => {
+                    const url = el.getAttribute('data-link-url');
+                    if (url) {
+                        const rect = el.getBoundingClientRect();
+                        const x = rect.left - containerRect.left;
+                        const y = rect.top - containerRect.top;
+                        pdf.link(x, y, rect.width, rect.height, { url: url, pageNumber: i + 1 });
+                    }
+                });
+                
+            } catch (err) {
+                console.error(`Error exporting record ${i}`, err);
+            }
+        }
+
+        pdf.save(`Bulk_Export_${filteredRecords.length}_Records.pdf`);
+        setExportProgress('');
+        setIsExporting(false);
+        setRecordIndex(0); 
+    };
+
+    // 6. RENDER HELPERS
+    const getPageBackgroundStyle = () => {
+        const activeImageUrl = sessionImage || pageStyle.imageUrl;
+        if (pageStyle.type === 'image' && activeImageUrl) {
+            return { 
+                backgroundImage: `url(${activeImageUrl})`, 
+                backgroundSize: 'cover', 
+                backgroundPosition: 'center' 
+            };
+        } else if (pageStyle.type === 'gradient') {
+            return { background: `linear-gradient(to bottom, ${pageStyle.color1}, ${pageStyle.color2})` };
+        } else {
+            return { backgroundColor: pageStyle.color1 };
+        }
+    };
+
+    // Shared visual rendering for both Root Elements and Stack Children
+    const renderElementContent = (el) => {
+        // 1. SHAPES
+        if (el.type === 'shape') {
+            return <div style={{width: '100%', height: '100%'}} />;
+        }
+        // 2. TEXT (Static or Field)
+        else if (el.displayMode === 'text') {
+            let textVal = el.text || '';
+            if (el.type === 'field' && currentRecord && el.fieldId) {
+                if (el.useCustomLabel && el.customLabelText) {
+                    textVal = el.customLabelText;
+                } else {
+                    // FIX: Use safe wrapper — fieldId may be from a different base
+                    textVal = safeGetCellValueAsString(currentRecord, table, el.fieldId);
+                }
+            }
+            return (
+                <div style={{width: '100%', height: '100%', wordWrap: 'break-word', overflow: 'hidden'}}>
+                    {textVal}
+                </div>
+            );
+        } 
+        // 3. IMAGES (Attachments)
+        else if (el.displayMode === 'image') {
+            let imgSrc = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='150' height='150'%3E%3Crect width='150' height='150' fill='%23e0e0e0'/%3E%3Ctext x='50%25' y='50%25' dominant-baseline='middle' text-anchor='middle' fill='%23999' font-size='12' font-family='sans-serif'%3ENo Image%3C/text%3E%3C/svg%3E";
+            if (el.type === 'field' && currentRecord && el.fieldId) {
+                // FIX: Use safe wrapper
+                const val = safeGetCellValue(currentRecord, table, el.fieldId);
+                if (Array.isArray(val) && val[0] && val[0].url) {
+                    imgSrc = imageCache[val[0].url] || val[0].url;
+                }
+            }
+            return (
+                <div 
+                    style={{
+                        width: '100%', 
+                        height: '100%', 
+                        backgroundImage: `url("${imgSrc}")`,
+                        backgroundSize: 'cover',
+                        backgroundPosition: 'center',
+                        backgroundRepeat: 'no-repeat'
+                    }} 
+                />
+            );
+        }
+        // 4. ICONS
+        else if (el.displayMode === 'icon') {
+            let iconSrc = DEFAULT_ICON;
+            if (el.iconType === 'custom' && el.customIcon) iconSrc = el.customIcon;
+            else if (el.iconType && ICONS[el.iconType]) iconSrc = ICONS[el.iconType];
+            
+            let linkUrl = "";
+            if (el.type === 'field' && currentRecord && el.fieldId) {
+                // FIX: Use safe wrapper
+                linkUrl = safeGetCellValueAsString(currentRecord, table, el.fieldId);
+            }
+
+            return (
+                <div 
+                    data-link-url={linkUrl}
+                    style={{
+                        width: '100%', 
+                        height: '100%', 
+                        backgroundImage: `url("${iconSrc}")`,
+                        backgroundSize: 'contain',
+                        backgroundPosition: 'center',
+                        backgroundRepeat: 'no-repeat'
+                    }} 
+                />
+            );
+        }
+        return null;
+    };
+
+    const activeElement = selectedStackChildId 
+        ? elements.find(e => e.id === selectedElementId)?.children?.find(c => c.id === selectedStackChildId) 
+        : elements.find(e => e.id === selectedElementId);
+
+    // 7. MAIN UI
+    return (
+        <Box display="flex" height="100vh" overflow="hidden">
+            
+            {/* --- SIDEBAR --- */}
+            <Box width="320px" borderRight="thick" display="flex" flexDirection="column" backgroundColor="#f9f9f9">
+                <Box display="flex" borderBottom="thick" backgroundColor="white">
+                    <Box 
+                        flex="1" padding={3} textAlign="center" cursor="pointer"
+                        backgroundColor={editMode === 'elements' ? '#eee' : 'white'}
+                        onClick={() => setEditMode('elements')}
+                        fontWeight={editMode === 'elements' ? 'bold' : 'normal'}
+                    >
+                        Elements
+                    </Box>
+                    <Box 
+                        flex="1" padding={3} textAlign="center" cursor="pointer"
+                        backgroundColor={editMode === 'page' ? '#eee' : 'white'}
+                        onClick={() => setEditMode('page')}
+                        fontWeight={editMode === 'page' ? 'bold' : 'normal'}
+                    >
+                        Page Bg
+                    </Box>
+                </Box>
+
+                <Box flex="1" overflowY="auto" padding={3}>
+                    {editMode === 'page' && (
+                        <>
+                            <Heading size="xsmall" marginBottom={2}>Page Dimensions</Heading>
+                            <Box display="flex" gap={2} marginBottom={3}>
+                                <Box flex="1">
+                                    <Label>Width (px)</Label>
+                                    <Input 
+                                        type="number"
+                                        value={pageStyle.width || DEFAULT_PAGE_WIDTH}
+                                        onChange={e => updatePageStyle({ width: parseInt(e.target.value) || DEFAULT_PAGE_WIDTH })}
+                                    />
+                                </Box>
+                                <Box flex="1">
+                                    <Label>Height (px)</Label>
+                                    <Input 
+                                        type="number"
+                                        value={pageStyle.height || DEFAULT_PAGE_HEIGHT}
+                                        onChange={e => updatePageStyle({ height: parseInt(e.target.value) || DEFAULT_PAGE_HEIGHT })}
+                                    />
+                                </Box>
+                            </Box>
+
+                            <Heading size="xsmall" marginBottom={2}>Page Background</Heading>
+                            <FormField label="Background Type">
+                                <Select 
+                                    options={[
+                                        {value: 'solid', label: 'Solid Color'},
+                                        {value: 'gradient', label: 'Gradient'},
+                                        {value: 'image', label: 'Image / Upload'},
+                                    ]}
+                                    value={pageStyle.type}
+                                    onChange={val => updatePageStyle({type: val})}
+                                />
+                            </FormField>
+
+                            {pageStyle.type === 'solid' && (
+                                <Box marginBottom={3}>
+                                    <Label>Color</Label>
+                                    <Box display="flex" gap={2}>
+                                        <Input type="color" value={pageStyle.color1} onChange={e => updatePageStyle({color1: e.target.value})} width="50px" style={{cursor:'pointer'}}/>
+                                        <Input value={pageStyle.color1} onChange={e => updatePageStyle({color1: e.target.value})} />
+                                    </Box>
+                                </Box>
+                            )}
+
+                            {pageStyle.type === 'gradient' && (
+                                <Box marginBottom={3}>
+                                    <Label>Top Color</Label>
+                                    <Box display="flex" gap={2} marginBottom={2}>
+                                        <Input type="color" value={pageStyle.color1} onChange={e => updatePageStyle({color1: e.target.value})} width="50px" style={{cursor:'pointer'}}/>
+                                        <Input value={pageStyle.color1} onChange={e => updatePageStyle({color1: e.target.value})} />
+                                    </Box>
+                                    <Label>Bottom Color</Label>
+                                    <Box display="flex" gap={2}>
+                                        <Input type="color" value={pageStyle.color2} onChange={e => updatePageStyle({color2: e.target.value})} width="50px" style={{cursor:'pointer'}}/>
+                                        <Input value={pageStyle.color2} onChange={e => updatePageStyle({color2: e.target.value})} />
+                                    </Box>
+                                </Box>
+                            )}
+
+                            {pageStyle.type === 'image' && (
+                                <Box marginBottom={3}>
+                                    <Label>Upload Image</Label>
+                                    <Input 
+                                        ref={fileInputRef}
+                                        type="file" 
+                                        accept="image/*"
+                                        onChange={handleFileUpload} 
+                                        style={{padding: '5px'}}
+                                    />
+                                    {pageStyle.imageUrl && (
+                                        <Button size="small" variant="danger" marginTop={2} onClick={() => updatePageStyle({imageUrl: ''})}>
+                                            Remove Image
+                                        </Button>
+                                    )}
+                                </Box>
+                            )}
+                        </>
+                    )}
+
+                    {editMode === 'elements' && !selectedElementId && (
+                        <>
+                            {/* ── TEMPLATE MANAGEMENT ── */}
+                            <Heading size="xsmall" marginBottom={2}>Template</Heading>
+                            <Box display="flex" flexDirection="column" gap={2} marginBottom={1}>
+                                <Button
+                                    icon="upload"
+                                    onClick={saveAsDefaultTemplate}
+                                    variant="primary"
+                                >
+                                    Save as Default Template
+                                </Button>
+                                <Button
+                                    icon="download"
+                                    onClick={exportTemplateJSON}
+                                    variant="secondary"
+                                >
+                                    Export template.json
+                                </Button>
+                                <Button
+                                    icon="redo"
+                                    onClick={loadDefaultTemplate}
+                                    variant="secondary"
+                                >
+                                    {globalConfig.get('defaultTemplate') ? 'Load Saved Default' : 'Load template.json'}
+                                </Button>
+                            </Box>
+                            <Text size="xsmall" textColor="light" marginBottom={3}>
+                                {globalConfig.get('defaultTemplate')
+                                    ? '✓ A saved default template exists for this workspace.'
+                                    : 'No saved default yet — using template.json as fallback.'}
+                            </Text>
+
+                            <Box height="1px" backgroundColor="lightGray2" marginBottom={3} />
+
+                            {/* ── ADD ELEMENTS ── */}
+                            <Heading size="xsmall" marginBottom={2}>Add Elements</Heading>
+                            <Box display="flex" flexDirection="column" gap={2} marginBottom={3}>
+                                <Button onClick={() => addElement('static')}>+ Add Static Text</Button>
+                                <Button onClick={() => addElement('field')}>+ Add Record Field</Button>
+                                <Button onClick={() => addElement('stack')}>+ Add Stack (Dynamic Row)</Button>
+                                <Button onClick={() => addShape('rectangle')}>+ Add Rectangle</Button>
+                                <Button onClick={() => addShape('line')}>+ Add Line</Button>
+                            </Box>
+
+                            <Heading size="xsmall" marginBottom={2}>Align Selected</Heading>
+                            <Text textColor="light">Select an element to see options</Text>
+                        </>
+                    )}
+
+                    {editMode === 'elements' && selectedElementId && (
+                        <>
+                            <Box display="flex" justifyContent="space-between" alignItems="center" marginBottom={3}>
+                                <Heading size="xsmall">Edit {selectedStackChildId ? 'Stack Item' : 'Element'}</Heading>
+                                <Button size="small" variant="danger" onClick={() => {
+                                    if(selectedStackChildId) {
+                                        removeStackItem(selectedStackChildId);
+                                    } else {
+                                        deleteElement(selectedElementId);
+                                    }
+                                }}>Delete</Button>
+                            </Box>
+                            
+                            {selectedStackChildId && (
+                                <Button marginBottom={3} onClick={() => setSelectedStackChildId(null)} icon="chevronLeft">
+                                    Back to Stack
+                                </Button>
+                            )}
+
+                            {/* --- STACK CONTAINER EDITOR (Only visible if no child selected) --- */}
+                            {elements.find(e => e.id === selectedElementId)?.type === 'stack' && !selectedStackChildId && (
+                                <Box marginBottom={3}>
+                                    <Label>Stack Layout</Label>
+                                    <Box display="flex" gap={1} marginBottom={2}>
+                                        <Select 
+                                            options={[
+                                                {value: 'row', label: 'Horizontal Row'},
+                                                {value: 'column', label: 'Vertical Column'}
+                                            ]}
+                                            value={elements.find(e => e.id === selectedElementId).stackDirection}
+                                            onChange={val => updateSelected({stackDirection: val})}
+                                        />
+                                    </Box>
+                                    <Label>Spacing (px)</Label>
+                                    <Input 
+                                        type="number"
+                                        value={elements.find(e => e.id === selectedElementId).stackSpacing}
+                                        onChange={e => updateSelected({stackSpacing: parseInt(e.target.value) || 0})}
+                                        marginBottom={2}
+                                    />
+                                    <Label>Alignment</Label>
+                                    <Select 
+                                        options={[
+                                            {value: 'flex-start', label: 'Start'},
+                                            {value: 'center', label: 'Center'},
+                                            {value: 'flex-end', label: 'End'},
+                                            {value: 'space-between', label: 'Space Between'}
+                                        ]}
+                                        value={elements.find(e => e.id === selectedElementId).stackAlign}
+                                        onChange={val => updateSelected({stackAlign: val})}
+                                    />
+
+                                    <Heading size="xsmall" marginTop={3} marginBottom={2}>Stack Items</Heading>
+                                    <Box display="flex" gap={1} marginBottom={2}>
+                                        <Button flex="1" size="small" onClick={() => addStackItem('icon')}>+ Icon</Button>
+                                        <Button flex="1" size="small" onClick={() => addStackItem('image')}>+ Image</Button>
+                                    </Box>
+                                    <Box display="flex" gap={1} marginBottom={2}>
+                                        <Button flex="1" size="small" onClick={() => addStackItem('field')}>+ Field</Button>
+                                        <Button flex="1" size="small" onClick={() => addStackItem('static')}>+ Text</Button>
+                                    </Box>
+                                    
+                                    {(elements.find(e => e.id === selectedElementId).children || []).map((child, idx) => (
+                                        <Box 
+                                            key={child.id} 
+                                            padding={2} 
+                                            border="default" 
+                                            marginBottom={2} 
+                                            borderRadius="default" 
+                                            backgroundColor="white"
+                                            style={{cursor: 'pointer', borderLeft: '4px solid #2d7ff9'}}
+                                            onClick={() => setSelectedStackChildId(child.id)}
+                                        >
+                                            <Box display="flex" justifyContent="space-between" alignItems="center">
+                                                <Text fontWeight="bold">Item {idx + 1}: {child.displayMode || child.type}</Text>
+                                                <Icon name="edit" size={12} />
+                                            </Box>
+                                            <Text size="xsmall" textColor="light" truncate>
+                                                {child.fieldId ? 'Linked Field' : child.text || 'Element'}
+                                            </Text>
+                                        </Box>
+                                    ))}
+                                </Box>
+                            )}
+
+                            {/* --- COMMON PROPERTY EDITORS (Used by both Root Elements and Stack Children) --- */}
+                            {activeElement && (
+                                <>
+                                    {activeElement.type === 'field' && (
+                                        <Box marginBottom={3} padding={2} border="default" borderRadius="large">
+                                            <Label>Connect to Field</Label>
+                                            <FieldPicker
+                                                table={table}
+                                                field={table.getFieldByIdIfExists(activeElement.fieldId)}
+                                                onChange={f => updateSelected({fieldId: f ? f.id : null})}
+                                            />
+                                            
+                                            <Box marginTop={2}>
+                                                <Box display="flex" alignItems="center" marginBottom={1}>
+                                                    <Switch 
+                                                        value={activeElement.useCustomLabel || false}
+                                                        onChange={val => updateSelected({useCustomLabel: val})}
+                                                        marginRight={2}
+                                                    />
+                                                    <Text>Use as Conditional Label</Text>
+                                                </Box>
+                                                {activeElement.useCustomLabel && (
+                                                    <Input 
+                                                        value={activeElement.customLabelText || ''}
+                                                        onChange={e => updateSelected({customLabelText: e.target.value})}
+                                                        placeholder="Enter label text..."
+                                                    />
+                                                )}
+                                            </Box>
+
+                                            {currentRecord && activeElement.fieldId && (
+                                                <Box marginTop={2} padding={2} backgroundColor="#f0f0f0" borderRadius="default">
+                                                    <Text size="xsmall" textColor="light">Current Value:</Text>
+                                                    <Text truncate>{currentRecord.getCellValueAsString(activeElement.fieldId) || "(Empty)"}</Text>
+                                                </Box>
+                                            )}
+                                            
+                                            <Label marginTop={2}>Display Mode</Label>
+                                            <Select 
+                                                options={[
+                                                    {value: 'text', label: 'Text'},
+                                                    {value: 'image', label: 'Image (Attachment)'},
+                                                    {value: 'icon', label: 'Clickable Icon'},
+                                                    {value: 'qr', label: 'QR Code (Future)'}
+                                                ]}
+                                                value={activeElement.displayMode}
+                                                onChange={val => updateSelected({displayMode: val})}
+                                            />
+                                            
+                                            {activeElement.displayMode === 'icon' && (
+                                                <Box marginTop={2}>
+                                                    <Label>Icon Type</Label>
+                                                    <Select 
+                                                        options={[
+                                                            {value: 'link', label: 'Generic Link'},
+                                                            {value: 'apple', label: 'Apple Music'},
+                                                            {value: 'spotify', label: 'Spotify'},
+                                                            {value: 'instagram', label: 'Instagram'},
+                                                            {value: 'youtube', label: 'YouTube'},
+                                                            {value: 'soundcloud', label: 'SoundCloud'},
+                                                            {value: 'tiktok', label: 'TikTok'},
+                                                            {value: 'custom', label: 'Custom Upload'}
+                                                        ]}
+                                                        value={activeElement.iconType}
+                                                        onChange={val => updateSelected({iconType: val})}
+                                                    />
+                                                    {activeElement.iconType === 'custom' && (
+                                                        <Input 
+                                                            ref={iconInputRef}
+                                                            type="file" 
+                                                            accept="image/*"
+                                                            marginTop={2}
+                                                            onChange={handleIconUpload}
+                                                        />
+                                                    )}
+                                                </Box>
+                                            )}
+                                        </Box>
+                                    )}
+
+                                    {activeElement.type === 'static' && (
+                                        <FormField label="Text Content">
+                                            <Input 
+                                                value={activeElement.text}
+                                                onChange={e => updateSelected({text: e.target.value})}
+                                            />
+                                        </FormField>
+                                    )}
+
+                                    <Heading size="xsmall" marginTop={3} marginBottom={2}>Styling</Heading>
+                                    
+                                    {selectedStackChildId && (
+                                        <Box marginBottom={2}>
+                                            <Label>Dimensions</Label>
+                                            <Box display="flex" gap={2}>
+                                                <Box flex="1">
+                                                    <Text size="xsmall" textColor="light">Width</Text>
+                                                    <Input type="number" value={activeElement.width} onChange={e => updateSelected({width: parseInt(e.target.value)||0})} />
+                                                </Box>
+                                                <Box flex="1">
+                                                    <Text size="xsmall" textColor="light">Height</Text>
+                                                    <Input type="number" value={activeElement.height} onChange={e => updateSelected({height: parseInt(e.target.value)||0})} />
+                                                </Box>
+                                            </Box>
+                                        </Box>
+                                    )}
+
+                                    <Box display="flex" gap={2}>
+                                        <Box flex="1">
+                                            <Label>Font Size</Label>
+                                            <Select 
+                                                options={[
+                                                    {value: '12px', label: '12'},
+                                                    {value: '14px', label: '14'},
+                                                    {value: '18px', label: '18'},
+                                                    {value: '24px', label: '24'},
+                                                    {value: '36px', label: '36'},
+                                                    {value: '48px', label: '48'},
+                                                    {value: '72px', label: '72'},
+                                                ]}
+                                                value={activeElement.style.fontSize}
+                                                onChange={val => updateSelectedStyle('fontSize', val)}
+                                            />
+                                        </Box>
+                                        <Box flex="1">
+                                            <Label>Color</Label>
+                                            <Input 
+                                                type="color" 
+                                                value={activeElement.style.color}
+                                                onChange={e => updateSelectedStyle('color', e.target.value)}
+                                                style={{cursor:'pointer', height: '32px'}}
+                                            />
+                                        </Box>
+                                    </Box>
+
+                                    <Box marginTop={2} display="flex" alignItems="center">
+                                        <Label marginRight={2}>Bold</Label>
+                                        <Switch 
+                                            value={activeElement.style.fontWeight === 'bold'}
+                                            onChange={val => updateSelectedStyle('fontWeight', val ? 'bold' : 'normal')}
+                                        />
+                                    </Box>
+
+                                    <Box marginTop={2}>
+                                        <Label>Font Family</Label>
+                                        <Select 
+                                            options={[
+                                                {value: 'Helvetica, Arial, sans-serif', label: 'Standard Sans'},
+                                                {value: '"Times New Roman", Times, serif', label: 'Standard Serif'},
+                                                {value: '"Inter", sans-serif', label: 'Inter (Google)'},
+                                                {value: '"Roboto", sans-serif', label: 'Roboto (Google)'},
+                                                {value: '"Oswald", sans-serif', label: 'Oswald (Google)'},
+                                            ]}
+                                            value={activeElement.style.fontFamily}
+                                            onChange={val => updateSelectedStyle('fontFamily', val)}
+                                        />
+                                    </Box>
+
+                                    {/* Only show alignment if it's a root element, stack children align via flex */}
+                                    {!selectedStackChildId && (
+                                        <Box marginTop={2} display="flex" gap={2}>
+                                            <Button size="small" onClick={() => handleAlign('left')}>Left</Button>
+                                            <Button size="small" onClick={() => handleAlign('center')}>Center</Button>
+                                            <Button size="small" onClick={() => handleAlign('right')}>Right</Button>
+                                        </Box>
+                                    )}
+                                    
+                                    <Box marginTop={2}>
+                                        <Label>Border</Label>
+                                        <Box display="flex" gap={2}>
+                                            <Select 
+                                                options={[
+                                                    {value: '0px', label: 'None'},
+                                                    {value: '1px', label: 'Thin'},
+                                                    {value: '3px', label: 'Thick'},
+                                                ]}
+                                                value={activeElement.style.borderWidth}
+                                                onChange={val => updateSelectedStyle('borderWidth', val)}
+                                            />
+                                            <Input 
+                                                type="color" 
+                                                value={activeElement.style.borderColor}
+                                                onChange={e => updateSelectedStyle('borderColor', e.target.value)}
+                                                style={{cursor:'pointer', height: '32px'}}
+                                            />
+                                        </Box>
+                                    </Box>
+                                </>
+                            )}
+                        </>
+                    )}
+                </Box>
+                
+                <Box padding={3} borderTop="thick" backgroundColor="white">
+                     <Button variant="danger" icon="trash" onClick={resetCanvas} width="100%">Clear Canvas</Button>
+                </Box>
+            </Box>
+
+            {/* --- MAIN AREA --- */}
+            <Box flex="1" display="flex" flexDirection="column" backgroundColor="#e0e0e0">
+                {/* TOOLBAR */}
+                <Box padding={2} backgroundColor="white" borderBottom="thick" display="flex" flexWrap="wrap" alignItems="center" gap={2}>
+                    <Heading size="small">Designer</Heading>
+                    
+                    <Box width="1px" height="20px" backgroundColor="lightGray2" marginX={2} />
+                    
+                    <Select 
+                        options={base.tables.map(t => ({value: t.id, label: t.name}))}
+                        value={selectedTableId}
+                        onChange={id => setSelectedTableId(id)}
+                        width="180px"
+                    />
+
+                    {/* MULTI-FIELD FILTER SECTION */}
+                    <Box display="flex" flexDirection="column" gap={1}>
+                        {filters.map(f => (
+                            <Box key={f.id} display="flex" alignItems="center" gap={1} border="default" borderRadius="default" padding={1} backgroundColor="white">
+                                <Icon name="filter" size={12} textColor="light" />
+                                <Box width="130px">
+                                    <FieldPicker
+                                        table={table}
+                                        field={f.fieldId ? table.getFieldByIdIfExists(f.fieldId) : null}
+                                        onChange={field => updateFilter(f.id, { fieldId: field ? field.id : null })}
+                                        placeholder="Field..."
+                                        size="small"
+                                    />
+                                </Box>
+                                <Input
+                                    value={f.keyword}
+                                    onChange={e => updateFilter(f.id, { keyword: e.target.value })}
+                                    placeholder="Value..."
+                                    width="110px"
+                                    size="small"
+                                />
+                                <Button icon="x" size="small" variant="secondary" onClick={() => removeFilter(f.id)} aria-label="Remove filter" />
+                            </Box>
+                        ))}
+                        <Box display="flex" gap={1}>
+                            <Button size="small" icon="plus" onClick={addFilter}>Add Filter</Button>
+                            {filters.length > 0 && (
+                                <Button size="small" variant="secondary" onClick={clearAllFilters}>Clear All</Button>
+                            )}
+                        </Box>
+                    </Box>
+
+                    <Box width="1px" height="20px" backgroundColor="lightGray2" marginX={2} />
+                    
+                    {/* NAVIGATION & SEARCH SECTION */}
+                    <Box display="flex" alignItems="center" gap={1}>
+                        <Button 
+                            icon="chevronLeft" 
+                            onClick={() => setRecordIndex(Math.max(0, recordIndex - 1))}
+                            disabled={recordIndex === 0} 
+                            size="small"
+                        />
+                        <Text width="100px" textAlign="center" size="small">
+                            {filteredRecords.length > 0 ? `${recordIndex + 1} / ${filteredRecords.length}` : "0 / 0"}
+                        </Text>
+                        <Button 
+                            icon="chevronRight" 
+                            onClick={() => setRecordIndex(Math.min(filteredRecords.length - 1, recordIndex + 1))}
+                            disabled={recordIndex >= filteredRecords.length - 1} 
+                            size="small"
+                        />
+                        <Input 
+                            placeholder="Jump to..."
+                            value={searchName}
+                            onChange={e => handleSearchJump(e.target.value)}
+                            width="120px"
+                            size="small"
+                            marginLeft={1}
+                        />
+                    </Box>
+
+                    <Box flex="1" />
+                    
+                    {exportProgress && <Text textColor="light" marginRight={2}>{exportProgress}</Text>}
+                    
+                    <Button 
+                        variant="primary" 
+                        onClick={generatePDF} 
+                        disabled={isExporting || !currentRecord}
+                        icon="download"
+                        marginRight={1}
+                    >
+                        Export Single
+                    </Button>
+                    <Button 
+                        variant="primary" 
+                        onClick={generateBulkPDF} 
+                        disabled={isExporting || filteredRecords.length === 0}
+                    >
+                        Export All ({filteredRecords.length})
+                    </Button>
+
+                    <Box width="1px" height="20px" backgroundColor="lightGray2" marginX={1} />
+
+                    <Button
+                        icon="personalAuto"
+                        variant="secondary"
+                        onClick={() => setManagerPanelOpen(true)}
+                    >
+                        My Clients
+                    </Button>
+                </Box>
+
+                {/* CANVAS WRAPPER */}
+                <Box flex="1" overflow="auto" display="flex" justifyContent="center" padding={5}>
+                    <div 
+                        ref={pageRef}
+                        id="print-container"
+                        onClick={() => { setSelectedElementId(null); setSelectedStackChildId(null); }}
+                        style={{
+                            ...getPageBackgroundStyle(),
+                            width: pageStyle.width,
+                            height: pageStyle.height,
+                            minWidth: pageStyle.width, 
+                            minHeight: pageStyle.height, 
+                            position: 'relative',
+                            boxShadow: '0 4px 15px rgba(0,0,0,0.15)',
+                            transition: 'all 0.2s',
+                            overflow: 'hidden', 
+                            flexShrink: 0 
+                        }}
+                    >
+                        {/* GUIDES OVERLAY */}
+                        {guides.map((g, i) => (
+                            <div 
+                                key={i}
+                                style={{
+                                    position: 'absolute',
+                                    backgroundColor: '#ff00ff',
+                                    zIndex: 999,
+                                    left: g.type === 'vertical' ? g.pos : 0,
+                                    top: g.type === 'horizontal' ? g.pos : 0,
+                                    width: g.type === 'vertical' ? '1px' : '100%',
+                                    height: g.type === 'vertical' ? '100%' : '1px',
+                                }}
+                            />
+                        ))}
+
+                        {elements.map(el => {
+                            const isSelected = selectedElementId === el.id && !selectedStackChildId && !isExporting;
+                            const isDragging = draggingState && draggingState.id === el.id;
+                            const visualX = isDragging ? draggingState.x : el.x;
+                            const visualY = isDragging ? draggingState.y : el.y;
+                            const visualWidth = (resizingState && resizingState.id === el.id) ? resizingState.currentW : (el.width || 200);
+                            const visualHeight = (resizingState && resizingState.id === el.id) ? resizingState.currentH : (el.height || 40);
+
+                            // --- CONTENT RENDERING LOGIC ---
+                            let content = null;
+                            
+                            // 1. STACKS (Dynamic Row/Col)
+                            if (el.type === 'stack') {
+                                content = (
+                                    <div style={{
+                                        width: '100%', 
+                                        height: '100%', 
+                                        display: 'flex',
+                                        flexDirection: el.stackDirection,
+                                        justifyContent: el.stackAlign,
+                                        alignItems: 'center',
+                                        gap: `${el.stackSpacing}px`,
+                                        padding: '5px', // Inner padding
+                                        flexWrap: 'wrap', // FIX: Allow wrap to prevent squish
+                                        overflow: 'hidden' // Clip children
+                                    }}>
+                                        {(el.children || []).map(child => {
+                                            // Check emptiness — FIX: use safe wrapper to avoid crash on stale fieldIds
+                                            let val = null;
+                                            if (child.fieldId && currentRecord) {
+                                                val = safeGetCellValueAsString(currentRecord, table, child.fieldId);
+                                            }
+                                            // If field is linked but empty (or missing), render nothing (collapse)
+                                            if (child.fieldId && !val) return null;
+                                            
+                                            // REUSE RENDER LOGIC
+                                            const childContent = renderElementContent(child);
+                                            const isChildSelected = selectedStackChildId === child.id && !isExporting;
+
+                                            return (
+                                                <div 
+                                                    key={child.id}
+                                                    onClick={(e) => { e.stopPropagation(); setSelectedStackChildId(child.id); setSelectedElementId(el.id); }}
+                                                    style={{
+                                                        ...child.style,
+                                                        width: `${child.width}px`,
+                                                        height: `${child.height}px`,
+                                                        flexShrink: 0,
+                                                        position: 'relative',
+                                                        border: isChildSelected ? '2px solid #fa243c' : child.style.borderWidth ? `${child.style.borderWidth} ${child.style.borderStyle} ${child.style.borderColor}` : 'none',
+                                                        cursor: 'pointer'
+                                                    }}
+                                                >
+                                                    {childContent}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                );
+                            } else {
+                                content = renderElementContent(el);
+                            }
+
+                            return (
+                                <Draggable
+                                    key={el.id}
+                                    position={{x: visualX, y: visualY}}
+                                    onStart={(e, data) => handleDrag(e, data, el.id)}
+                                    onDrag={(e, data) => handleDrag(e, data, el.id)}
+                                    onStop={(e, data) => handleDragStop(e, data, el.id)}
+                                    bounds="parent"
+                                    // FIX: Only disable dragging on the element whose child is selected,
+                                    // not globally on all elements. This lets other elements still be moved.
+                                    disabled={selectedStackChildId !== null && el.id === selectedElementId} 
+                                >
+                                    <div
+                                        style={{
+                                            ...el.style,
+                                            width: visualWidth,
+                                            height: visualHeight,
+                                            position: 'absolute',
+                                            cursor: 'move',
+                                            border: isSelected ? '1px dashed #2d7ff9' : el.style.borderWidth ? `${el.style.borderWidth} ${el.style.borderStyle} ${el.style.borderColor}` : '1px solid transparent',
+                                            boxSizing: 'border-box',
+                                            transform: 'translateZ(0)',
+                                        }}
+                                        onClick={(e) => { 
+                                            e.stopPropagation(); 
+                                            setSelectedElementId(el.id); 
+                                            setSelectedStackChildId(null); 
+                                            setEditMode('elements'); 
+                                        }}
+                                    >
+                                        {content}
+                                        
+                                        {isSelected && (
+                                            <div 
+                                                className="resize-handle"
+                                                style={{
+                                                    width: '10px', height: '10px', backgroundColor: '#2d7ff9',
+                                                    position: 'absolute', right: 0, bottom: 0, cursor: 'nwse-resize',
+                                                    zIndex: 10, borderTopLeftRadius: '2px'
+                                                }}
+                                                onMouseDown={(e) => startResizing(e, el.id, visualWidth, visualHeight)}
+                                            />
+                                        )}
+                                    </div>
+                                </Draggable>
+                            );
+                        })}
+                    </div>
+                </Box>
+            </Box>
+
+            {/* ── MANAGER CLIENT EDITOR PANEL ───────────────────────────────── */}
+            {managerPanelOpen && (
+                <Box
+                    position="fixed"
+                    top="0" right="0" bottom="0"
+                    width="400px"
+                    backgroundColor="white"
+                    borderLeft="thick"
+                    display="flex"
+                    flexDirection="column"
+                    style={{ zIndex: 1000, boxShadow: '-4px 0 20px rgba(0,0,0,0.15)' }}
+                >
+                    {/* Panel header */}
+                    <Box padding={3} borderBottom="thick" display="flex" justifyContent="space-between" alignItems="center">
+                        <Box>
+                            <Heading size="small">My Clients</Heading>
+                            <Text size="xsmall" textColor="light">
+                                Filtering for: <strong>{managerName || 'not set'}</strong>
+                            </Text>
+                        </Box>
+                        <Button icon="x" variant="secondary" onClick={() => setManagerPanelOpen(false)} aria-label="Close panel" />
+                    </Box>
+
+                    {/* Field configuration */}
+                    <Box padding={3} borderBottom="default" backgroundColor="#f9f9f9">
+                        <Text size="xsmall" textColor="light" marginBottom={2}>
+                            Configure your name and which fields to use:
+                        </Text>
+                        <Box marginBottom={2}>
+                            <Label>Your Name (must match the manager field value)</Label>
+                            <Input
+                                value={managerName}
+                                onChange={e => saveManagerName(e.target.value)}
+                                placeholder="e.g. Jane Smith"
+                            />
+                        </Box>
+                        <Box marginBottom={2}>
+                            <Label>Manager Field (contains your name)</Label>
+                            <FieldPicker
+                                table={table}
+                                field={managerFieldId ? table.getFieldByIdIfExists(managerFieldId) : null}
+                                onChange={f => setManagerFieldId(f ? f.id : null)}
+                                placeholder="Pick manager field..."
+                            />
+                        </Box>
+                        <Box>
+                            <Label>Clients Field (editable text/notes)</Label>
+                            <FieldPicker
+                                table={table}
+                                field={clientsFieldId ? table.getFieldByIdIfExists(clientsFieldId) : null}
+                                onChange={f => setClientsFieldId(f ? f.id : null)}
+                                placeholder="Pick clients field..."
+                            />
+                        </Box>
+                    </Box>
+
+                    {/* Records list */}
+                    <Box flex="1" overflowY="auto" padding={3}>
+                        {!managerFieldId || !clientsFieldId ? (
+                            <Text textColor="light" textAlign="center" marginTop={4}>
+                                Select both fields above to see your records.
+                            </Text>
+                        ) : myManagerRecords.length === 0 ? (
+                            <Box textAlign="center" marginTop={4}>
+                                <Text textColor="light">No records found where</Text>
+                                <Text textColor="light">the manager field contains</Text>
+                                <Text fontWeight="bold">"{managerName || '(no name set)'}"</Text>
+                            </Box>
+                        ) : (
+                            myManagerRecords.map(record => {
+                                const isEditing = managerEditingId === record.id;
+                                const clientVal = safeGetCellValueAsString(record, table, clientsFieldId);
+                                return (
+                                    <Box
+                                        key={record.id}
+                                        padding={2}
+                                        marginBottom={2}
+                                        border="default"
+                                        borderRadius="default"
+                                        backgroundColor={isEditing ? '#f0f7ff' : 'white'}
+                                        style={{ borderLeft: `4px solid ${isEditing ? '#2d7ff9' : '#e0e0e0'}` }}
+                                    >
+                                        <Text fontWeight="bold" marginBottom={1}>{record.name || '(Unnamed)'}</Text>
+                                        {isEditing ? (
+                                            <Box>
+                                                <Input
+                                                    value={managerEditValue}
+                                                    onChange={e => setManagerEditValue(e.target.value)}
+                                                    placeholder="Enter client list..."
+                                                    style={{ width: '100%', marginBottom: '8px', minHeight: '60px' }}
+                                                />
+                                                <Box display="flex" gap={1} marginTop={1}>
+                                                    <Button
+                                                        size="small"
+                                                        variant="primary"
+                                                        onClick={() => saveClientEdit(record)}
+                                                        disabled={managerSaving}
+                                                    >
+                                                        {managerSaving ? 'Saving...' : 'Save'}
+                                                    </Button>
+                                                    <Button
+                                                        size="small"
+                                                        variant="secondary"
+                                                        onClick={() => setManagerEditingId(null)}
+                                                        disabled={managerSaving}
+                                                    >
+                                                        Cancel
+                                                    </Button>
+                                                </Box>
+                                            </Box>
+                                        ) : (
+                                            <Box display="flex" justifyContent="space-between" alignItems="flex-start">
+                                                <Text size="small" textColor={clientVal ? 'default' : 'light'} style={{ flex: 1, marginRight: '8px', whiteSpace: 'pre-wrap' }}>
+                                                    {clientVal || 'No clients listed'}
+                                                </Text>
+                                                <Button
+                                                    size="small"
+                                                    icon="edit"
+                                                    variant="secondary"
+                                                    onClick={() => startEditingClient(record)}
+                                                >
+                                                    Edit
+                                                </Button>
+                                            </Box>
+                                        )}
+                                    </Box>
+                                );
+                            })
+                        )}
+                    </Box>
+
+                    {/* Panel footer */}
+                    <Box padding={3} borderTop="thick" backgroundColor="#f9f9f9">
+                        <Text size="xsmall" textColor="light">
+                            {myManagerRecords.length} record{myManagerRecords.length !== 1 ? 's' : ''} assigned to you
+                            {activeFilters.length > 0 ? ' (active filters apply)' : ''}.
+                            Only you can see this view — other managers see only their own records.
+                        </Text>
+                    </Box>
+                </Box>
+            )}
+        </Box>
+    );
+}
+
+initializeBlock(() => <UpgradedPageDesigner />);
