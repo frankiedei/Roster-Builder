@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useLayoutEffect } from 'react';
 /**
  * FIXES APPLIED (production release bugs):
  *
@@ -219,6 +219,63 @@ const fetchImageAsBase64 = (url) => {
     });
 };
 
+// --- AUTO-FIT TEXT ---
+// Renders text that shrinks its font size (never grows past the configured size)
+// until it fits inside its box on BOTH axes. Used for bios and any field whose
+// length varies record-to-record. The fit runs in a layout effect via a binary
+// search on the live DOM node, so it settles synchronously before the browser
+// paints — which means the PDF capture (which waits for paint) always sees the
+// final size, on every record in a bulk export.
+const AUTOFIT_MIN_PX = 5;
+function AutoFitText({ text, baseFontSize, boxW, boxH }) {
+    const ref = useRef(null);
+    const startSize = parseFloat(baseFontSize) || 14;
+    const [fontSize, setFontSize] = useState(startSize);
+
+    useLayoutEffect(() => {
+        const node = ref.current;
+        if (!node) return;
+
+        const fits = () => node.scrollHeight <= node.clientHeight + 0.5
+            && node.scrollWidth <= node.clientWidth + 0.5;
+
+        // If it already fits at the configured size, keep that size.
+        node.style.fontSize = startSize + 'px';
+        if (fits()) {
+            node.style.fontSize = '';
+            setFontSize(startSize);
+            return;
+        }
+
+        // Binary search the largest size (down to AUTOFIT_MIN_PX) that fits.
+        let lo = AUTOFIT_MIN_PX;
+        let hi = startSize;
+        let best = AUTOFIT_MIN_PX;
+        for (let i = 0; i < 18 && hi - lo > 0.25; i++) {
+            const mid = (lo + hi) / 2;
+            node.style.fontSize = mid + 'px';
+            if (fits()) { best = mid; lo = mid; } else { hi = mid; }
+        }
+        node.style.fontSize = '';
+        setFontSize(best);
+    }, [text, startSize, boxW, boxH]);
+
+    return (
+        <div
+            ref={ref}
+            style={{
+                width: '100%',
+                height: '100%',
+                overflow: 'hidden',
+                wordWrap: 'break-word',
+                fontSize: fontSize + 'px'
+            }}
+        >
+            {text}
+        </div>
+    );
+}
+
 function UpgradedPageDesigner() {
     // 2. STATE MANAGEMENT
     const base = useBase();
@@ -251,6 +308,11 @@ function UpgradedPageDesigner() {
     const [filters, setFilters] = useState([]);
     const [exportProgress, setExportProgress] = useState('');
 
+    // --- SORT STATE ---
+    // Sort by any field (incl. the primary / artist name). null = table's natural order.
+    const [sortFieldId, setSortFieldId] = useState(null);
+    const [sortDirection, setSortDirection] = useState('asc');
+
     // --- MANAGER CLIENT EDITOR STATE ---
     const [managerPanelOpen, setManagerPanelOpen] = useState(false);
     const [managerFieldId, setManagerFieldId] = useState(null);   // field that holds manager name
@@ -275,7 +337,14 @@ function UpgradedPageDesigner() {
 
     // Data Fetching
     const table = base.getTableByIdIfExists(selectedTableId);
-    const records = useRecords(table, { limit: 500 }); 
+    // Sort via the SDK so each field type (text, number, date, etc.) sorts correctly.
+    // Guard against a stale/foreign sortFieldId by resolving it against the live table.
+    const sortField = (sortFieldId && table) ? table.getFieldByIdIfExists(sortFieldId) : null;
+    const recordQueryOpts = useMemo(
+        () => (sortField ? { sorts: [{ field: sortField, direction: sortDirection }] } : undefined),
+        [sortField, sortDirection]
+    );
+    const records = useRecords(table, recordQueryOpts);
 
     // --- AUTO-LOAD TEMPLATE ON FIRST RUN ---
     // Priority: (1) saved defaultTemplate in globalConfig, (2) static template.json.
@@ -323,7 +392,7 @@ function UpgradedPageDesigner() {
 
     useEffect(() => {
         setRecordIndex(0);
-    }, [JSON.stringify(filters)]);
+    }, [JSON.stringify(filters), sortFieldId, sortDirection]);
 
     const addFilter = () => {
         setFilters(prev => [...prev, { id: Date.now().toString(), fieldId: null, keyword: '' }]);
@@ -1118,6 +1187,16 @@ function UpgradedPageDesigner() {
                     textVal = safeGetCellValueAsString(currentRecord, table, el.fieldId);
                 }
             }
+            if (el.autoFitText) {
+                return (
+                    <AutoFitText
+                        text={textVal}
+                        baseFontSize={el.style && el.style.fontSize}
+                        boxW={el.width}
+                        boxH={el.height}
+                    />
+                );
+            }
             return (
                 <div style={{width: '100%', height: '100%', wordWrap: 'break-word', overflow: 'hidden'}}>
                     {textVal}
@@ -1563,6 +1642,24 @@ function UpgradedPageDesigner() {
                                         </Box>
                                     </Box>
 
+                                    {(activeElement.type === 'static' || (activeElement.type === 'field' && activeElement.displayMode === 'text')) && (
+                                        <Box marginTop={2} padding={2} border="default" borderRadius="default" backgroundColor="white">
+                                            <Box display="flex" alignItems="center">
+                                                <Switch
+                                                    value={activeElement.autoFitText || false}
+                                                    onChange={val => updateSelected({autoFitText: val})}
+                                                    marginRight={2}
+                                                />
+                                                <Text>Auto-fit text to box</Text>
+                                            </Box>
+                                            {activeElement.autoFitText && (
+                                                <Text size="xsmall" textColor="light" marginTop={1}>
+                                                    Font size above acts as the maximum; long text shrinks to fit. Resize the box to control wrapping.
+                                                </Text>
+                                            )}
+                                        </Box>
+                                    )}
+
                                     <Box marginTop={2} display="flex" alignItems="center">
                                         <Label marginRight={2}>Bold</Label>
                                         <Switch 
@@ -1640,6 +1737,39 @@ function UpgradedPageDesigner() {
                         onChange={id => setSelectedTableId(id)}
                         width="180px"
                     />
+
+                    {/* SORT SECTION — sort by any field, incl. artist name */}
+                    <Box display="flex" alignItems="center" gap={1} border="default" borderRadius="default" padding={1} backgroundColor="white">
+                        <Icon name="sort" size={12} textColor="light" />
+                        <Box width="130px">
+                            <FieldPicker
+                                table={table}
+                                field={sortField}
+                                onChange={f => setSortFieldId(f ? f.id : null)}
+                                placeholder="Sort by..."
+                                size="small"
+                            />
+                        </Box>
+                        <Tooltip content={sortDirection === 'asc' ? 'Ascending (A→Z, 0→9)' : 'Descending (Z→A, 9→0)'}>
+                            <Button
+                                size="small"
+                                variant="secondary"
+                                icon={sortDirection === 'asc' ? 'chevronUp' : 'chevronDown'}
+                                onClick={() => setSortDirection(d => d === 'asc' ? 'desc' : 'asc')}
+                                disabled={!sortFieldId}
+                                aria-label="Toggle sort direction"
+                            />
+                        </Tooltip>
+                        {sortFieldId && (
+                            <Button
+                                size="small"
+                                variant="secondary"
+                                icon="x"
+                                onClick={() => setSortFieldId(null)}
+                                aria-label="Clear sort"
+                            />
+                        )}
+                    </Box>
 
                     {/* MULTI-FIELD FILTER SECTION */}
                     <Box display="flex" flexDirection="column" gap={1}>
