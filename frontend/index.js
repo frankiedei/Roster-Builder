@@ -84,6 +84,16 @@ import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
 import templateData from './template.json';
 
+// FIX (real crash — "ReferenceError: process is not defined" on any click):
+// react-draggable's internal log() helper reads `process.env.DRAGGABLE_DEBUG` inside
+// handleDragStart, which runs on the mousedown of every drag. Airtable's released-block
+// bundle does not define `process`, so that bare lookup throws on the first click of any
+// canvas element. Provide a minimal global shim so the env access simply resolves to
+// undefined. (typeof on an undeclared identifier is safe and never throws.)
+if (typeof process === 'undefined') {
+    globalThis.process = { env: {} };
+}
+
 // 1. ASSETS
 // Default fallback icon (Link chain)
 const DEFAULT_ICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Cpath fill='%23333' d='M326.612 185.391c59.747 59.809 58.927 155.698.36 214.59-.11.12-.24.25-.36.37l-67.2 67.2c-59.27 59.27-155.699 59.262-214.96 0-59.27-59.26-59.27-155.7 0-214.96l37.106-37.106c9.84-9.84 26.786-3.3 27.294 10.606.648 17.722 3.826 35.527 9.69 52.721 1.986 5.822.567 12.262-3.783 16.612l-13.087 13.087c-28.026 28.026-28.905 73.66-1.155 101.96 28.024 28.579 74.086 28.749 102.325.51l67.2-67.19c28.191-28.191 28.073-73.757 0-101.83-3.701-3.694-7.429-6.564-10.341-8.569a16.037 16.037 0 0 1-6.947-12.606c-.396-10.567 3.348-21.456 11.698-29.806l21.054-21.055c5.521-5.521 14.182-6.199 20.584-1.731a152.482 152.482 0 0 1 20.522 17.197zM467.547 44.449c-59.261-59.262-155.69-59.27-214.96 0l-67.2 67.2c-.12.12-.25.25-.36.37-58.566 58.892-59.387 154.781.36 214.59a152.454 152.454 0 0 0 20.521 17.196c6.402 4.468 15.064 3.789 20.584-1.731l21.054-21.055c8.35-8.35 12.094-19.239 11.698-29.806a16.037 16.037 0 0 0-6.947-12.606c-2.912-2.005-6.64-4.875-10.341-8.569-28.073-28.073-28.191-73.639 0-101.83l67.2-67.19c28.239-28.239 74.3-28.069 102.325.51 27.75 28.3 26.872 73.934-1.155 101.96l-13.087 13.087c-4.35 4.35-5.769 10.79-3.783 16.612 5.864 17.194 9.042 34.999 9.69 52.721.509 13.906 17.454 20.446 27.294 10.606l37.106-37.106c59.271-59.26 59.271-155.69 0-214.96z'/%3E%3C/svg%3E";
@@ -180,7 +190,7 @@ const fetchImageAsBase64 = (url) => {
         img.onload = () => {
             try {
                 const canvas = document.createElement('canvas');
-                const MAX_SIZE = 800;
+                const MAX_SIZE = 1600;
                 let width = img.width;
                 let height = img.height;
 
@@ -220,8 +230,6 @@ function UpgradedPageDesigner() {
     
     const rawPageStyle = globalConfig.get('pageStyle');
     const pageStyle = rawPageStyle ? { ...DEFAULT_PAGE_STYLE, ...rawPageStyle } : DEFAULT_PAGE_STYLE;
-
-    console.log("MY TEMPLATE: ", JSON.stringify({ elements: rawElements, pageStyle: rawPageStyle }));
 
     // --- LOCAL UI STATE ---
     const storedTableId = globalConfig.get('selectedTableId');
@@ -366,7 +374,7 @@ function UpgradedPageDesigner() {
     const handleSearchJump = (name) => {
         setSearchName(name);
         if (!name) return;
-        const index = filteredRecords.findIndex(r => r.name.toLowerCase().includes(name.toLowerCase()));
+        const index = filteredRecords.findIndex(r => (r.name || '').toLowerCase().includes(name.toLowerCase()));
         if (index !== -1) {
             setRecordIndex(index);
         }
@@ -383,6 +391,17 @@ function UpgradedPageDesigner() {
     const pageRef = useRef(null);
     const fileInputRef = useRef(null);
     const iconInputRef = useRef(null); 
+    // FIX (crash on click): react-draggable v4 without a nodeRef falls back to the
+    // deprecated ReactDOM.findDOMNode. In the released-block iframe that lookup can
+    // resolve to null, and react-draggable then reads `.parentNode`/offsets off null
+    // on drag-start — which fires on the mousedown of ANY click on a canvas element
+    // (made worse by bounds="parent"). Giving each Draggable its own ref removes the
+    // findDOMNode path entirely. We keep one stable ref per element id.
+    const nodeRefs = useRef({});
+    const getNodeRef = (id) => {
+        if (!nodeRefs.current[id]) nodeRefs.current[id] = React.createRef();
+        return nodeRefs.current[id];
+    };
 
     // 3. ACTIONS
     const updateElements = (newElements) => {
@@ -894,47 +913,85 @@ function UpgradedPageDesigner() {
     }, [currentRecord?.id]); // Depend on ID only — stable reference
 
     // 6. PDF GENERATION
-    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    // Capture resolution multiplier. Higher = crisper output (text, raster images,
+    // and rasterized vectors), at the cost of memory/time. cropCanvas MUST use the
+    // same value or the crop will be misaligned.
+    const EXPORT_SCALE = 3;
 
-    // NEW: Function to Strictly Crop Canvas (Fixes Squish)
+    // Wait until the browser has committed and painted the latest render, and every
+    // <img> inside the container has decoded. This replaces the old fixed sleep(1200)
+    // guess: it is faster (no wasted waiting) AND reliable (we wait on real readiness,
+    // not a timer that may be too short on a slow iframe or too long otherwise).
+    const nextFrame = () => new Promise(res => requestAnimationFrame(() => requestAnimationFrame(res)));
+
+    const waitForRenderReady = async (container) => {
+        await nextFrame(); // let React commit + the browser lay out the new record
+        if (container) {
+            const imgs = Array.from(container.querySelectorAll('img'));
+            await Promise.all(imgs.map(img => {
+                if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+                return img.decode().catch(() => new Promise(r => { img.onload = img.onerror = r; }));
+            }));
+        }
+        if (document.fonts && document.fonts.ready) {
+            try { await document.fonts.ready; } catch (e) { /* ignore */ }
+        }
+        await nextFrame(); // one more paint for safety
+    };
+
+    // Crop the html2canvas output to exactly the page box (removes scroll overflow).
     const cropCanvas = (sourceCanvas, width, height) => {
         const newCanvas = document.createElement('canvas');
-        // We use scale:2 in html2canvas, so we match it here
-        newCanvas.width = width * 2; 
-        newCanvas.height = height * 2;
+        newCanvas.width = width * EXPORT_SCALE;
+        newCanvas.height = height * EXPORT_SCALE;
         const ctx = newCanvas.getContext('2d');
-        
-        // Draw only the top-left portion (0,0 to width,height) to ensure we don't get the scrollbar area
         ctx.drawImage(sourceCanvas, 0, 0, newCanvas.width, newCanvas.height, 0, 0, newCanvas.width, newCanvas.height);
         return newCanvas;
     };
 
-    const generatePDF = async () => {
-        if (!pageRef.current || !currentRecord) return;
-        setIsExporting(true);
-        setExportProgress("Preparing images...");
+    // Pre-fetch + pre-decode every attachment image across ALL given records in one
+    // pass, so the per-record capture loop never waits on the network. Dedupes by URL
+    // and commits the cache once. Pre-decoding warms the browser image cache so the
+    // base64 source paints on the very next frame.
+    const prepareAllRecordsForPrint = async (recordsToPrint) => {
+        const currentElements = elementsRef.current;
+        const currentCache = imageCacheRef.current;
+        const cacheUpdates = {};
 
-        // 1. Pre-load images as Base64 to prevent blank boxes
-        await prepareRecordForPrint(currentRecord);
-        await sleep(500); // Allow React to re-render with Base64 sources
+        const urlsForRecord = (record) => {
+            const urls = [];
+            const collect = (el) => {
+                if (el.type === 'field' && record && el.fieldId) {
+                    const raw = safeGetCellValue(record, table, el.fieldId);
+                    if (Array.isArray(raw) && raw[0] && raw[0].url) urls.push(raw[0].url);
+                }
+                if (el.type === 'stack' && el.children) el.children.forEach(collect);
+            };
+            currentElements.forEach(collect);
+            return urls;
+        };
 
-        setExportProgress("Generating PDF...");
-        
-        const orientation = pageStyle.width > pageStyle.height ? 'l' : 'p';
-        // FIX: Use 'px' to match DOM coordinates exactly
-        const pdf = new jsPDF({
-            orientation: orientation,
-            unit: 'px',
-            format: [pageStyle.width, pageStyle.height]
-        }); 
-        
-        // 2. Capture without forcing window size (fixes extra whitespace)
-        // FIX: Ensure allowTaint is false so images can be drawn securely if possible, OR
-        // allow the base64 fallback to work.
+        const allUrls = [...new Set(recordsToPrint.flatMap(urlsForRecord))];
+        for (const url of allUrls) {
+            if (currentCache[url] || cacheUpdates[url]) continue;
+            const base64 = await fetchImageAsBase64(url);
+            if (base64) {
+                cacheUpdates[url] = base64;
+                try { const im = new Image(); im.src = base64; await im.decode(); } catch (e) { /* ignore */ }
+            }
+        }
+        if (Object.keys(cacheUpdates).length > 0) {
+            setImageCache(prev => ({ ...prev, ...cacheUpdates }));
+        }
+    };
+
+    // Capture the live page container to a cropped PNG data URL.
+    const capturePageImage = async () => {
+        await waitForRenderReady(pageRef.current);
         const canvas = await html2canvas(pageRef.current, {
-            scale: 2, 
-            useCORS: true, 
-            allowTaint: false, // Strict OFF to allow toDataURL
+            scale: EXPORT_SCALE,
+            useCORS: true,
+            allowTaint: false,
             backgroundColor: null,
             width: pageStyle.width,
             height: pageStyle.height,
@@ -945,107 +1002,87 @@ function UpgradedPageDesigner() {
             x: 0,
             y: 0
         });
+        const cropped = cropCanvas(canvas, pageStyle.width, pageStyle.height);
+        return cropped.toDataURL('image/png');
+    };
 
-        // 3. Crop canvas to strictly match page size (removes scroll overflow/blank sections)
-        const croppedCanvas = cropCanvas(canvas, pageStyle.width, pageStyle.height);
-        const imgData = croppedCanvas.toDataURL('image/png');
-
-        pdf.addImage(imgData, 'PNG', 0, 0, pageStyle.width, pageStyle.height, undefined, 'FAST');
-
-        // NEW: Add hyperlinks by scanning the actual rendered DOM
-        // This accounts for nested stack items and their dynamic positions
+    // Overlay real (vector, clickable) hyperlinks onto the current PDF page by scanning
+    // the DOM. unit is 'px' and matches the container, so no scaling math is needed.
+    const addPageLinks = (pdf, pageNumber) => {
         const containerRect = pageRef.current.getBoundingClientRect();
-        const linkElements = pageRef.current.querySelectorAll('[data-link-url]');
-        
-        linkElements.forEach(el => {
+        pageRef.current.querySelectorAll('[data-link-url]').forEach(el => {
             const url = el.getAttribute('data-link-url');
-            if (url) {
-                const rect = el.getBoundingClientRect();
-                // Calculate position relative to the print container
-                // We don't need scaling math because jsPDF unit is 'px' and matches container size
-                const x = rect.left - containerRect.left;
-                const y = rect.top - containerRect.top;
-                const w = rect.width;
-                const h = rect.height;
-                
-                pdf.link(x, y, w, h, { url: url });
-            }
+            if (!url) return;
+            const rect = el.getBoundingClientRect();
+            const opts = { url };
+            if (pageNumber) opts.pageNumber = pageNumber;
+            pdf.link(rect.left - containerRect.left, rect.top - containerRect.top, rect.width, rect.height, opts);
         });
+    };
 
-        pdf.save(`Roster-${currentRecord.name}.pdf`);
-        setExportProgress('');
-        setIsExporting(false);
+    const generatePDF = async () => {
+        if (!pageRef.current || !currentRecord) return;
+        setIsExporting(true);
+        try {
+            setExportProgress("Preparing images...");
+            await prepareAllRecordsForPrint([currentRecord]);
+
+            setExportProgress("Generating PDF...");
+            const orientation = pageStyle.width > pageStyle.height ? 'l' : 'p';
+            const pdf = new jsPDF({ orientation, unit: 'px', format: [pageStyle.width, pageStyle.height] });
+
+            const imgData = await capturePageImage();
+            pdf.addImage(imgData, 'PNG', 0, 0, pageStyle.width, pageStyle.height, undefined, 'FAST');
+            addPageLinks(pdf);
+
+            pdf.save(`Roster-${currentRecord.name}.pdf`);
+        } catch (err) {
+            console.error("Single export failed:", err);
+            alert("Export failed: " + (err && err.message ? err.message : err));
+        } finally {
+            setExportProgress('');
+            setIsExporting(false);
+        }
     };
 
     const generateBulkPDF = async () => {
         if (!pageRef.current || filteredRecords.length === 0) return;
-        
         if (!confirm(`This will export ${filteredRecords.length} records. It may take a moment. Continue?`)) return;
 
         setIsExporting(true);
-        const orientation = pageStyle.width > pageStyle.height ? 'l' : 'p';
-        const pdf = new jsPDF({
-            orientation: orientation,
-            unit: 'px',
-            format: [pageStyle.width, pageStyle.height]
-        });
-        
-        for (let i = 0; i < filteredRecords.length; i++) {
-            setExportProgress(`Processing ${i + 1} of ${filteredRecords.length}`);
-            setRecordIndex(i);
-            
-            // 1. Pre-load images for THIS record
-            await prepareRecordForPrint(filteredRecords[i]);
-            // FIX: Increase sleep — setRecordIndex triggers an async React re-render.
-            // 800ms was not reliable in production (slower iframe). 1200ms is safer.
-            await sleep(1200); // Wait for React to commit the new record to the DOM
+        const records = filteredRecords;   // snapshot so the list can't shift mid-export
+        const savedIndex = recordIndex;    // restore the user's view when we're done
+        try {
+            // Fetch + decode every image once, up front. The loop below then never
+            // waits on the network — only on the (fast) per-record render.
+            setExportProgress('Preparing images...');
+            await prepareAllRecordsForPrint(records);
 
-            try {
-                // 2. Capture naturally
-                const canvas = await html2canvas(pageRef.current, {
-                    scale: 2, 
-                    useCORS: true, 
-                    allowTaint: false, 
-                    backgroundColor: null,
-                    width: pageStyle.width,
-                    height: pageStyle.height,
-                    windowWidth: pageStyle.width,
-                    windowHeight: pageStyle.height,
-                    scrollX: 0,
-                    scrollY: 0,
-                    x: 0,
-                    y: 0
-                });
-                
-                // 3. Strict Crop
-                const croppedCanvas = cropCanvas(canvas, pageStyle.width, pageStyle.height);
-                const imgData = croppedCanvas.toDataURL('image/png');
-                
-                if (i > 0) pdf.addPage([pageStyle.width, pageStyle.height], orientation);
-                pdf.addImage(imgData, 'PNG', 0, 0, pageStyle.width, pageStyle.height, undefined, 'FAST');
-                
-                // Add links for this page
-                const containerRect = pageRef.current.getBoundingClientRect();
-                const linkElements = pageRef.current.querySelectorAll('[data-link-url]');
-                linkElements.forEach(el => {
-                    const url = el.getAttribute('data-link-url');
-                    if (url) {
-                        const rect = el.getBoundingClientRect();
-                        const x = rect.left - containerRect.left;
-                        const y = rect.top - containerRect.top;
-                        pdf.link(x, y, rect.width, rect.height, { url: url, pageNumber: i + 1 });
-                    }
-                });
-                
-            } catch (err) {
-                console.error(`Error exporting record ${i}`, err);
+            const orientation = pageStyle.width > pageStyle.height ? 'l' : 'p';
+            const pdf = new jsPDF({ orientation, unit: 'px', format: [pageStyle.width, pageStyle.height] });
+
+            for (let i = 0; i < records.length; i++) {
+                setExportProgress(`Rendering ${i + 1} of ${records.length}`);
+                setRecordIndex(i);
+                try {
+                    const imgData = await capturePageImage(); // waits for real readiness, not a timer
+                    if (i > 0) pdf.addPage([pageStyle.width, pageStyle.height], orientation);
+                    pdf.addImage(imgData, 'PNG', 0, 0, pageStyle.width, pageStyle.height, undefined, 'FAST');
+                    addPageLinks(pdf, i + 1);
+                } catch (err) {
+                    console.error(`Error exporting record ${i} (${records[i] && records[i].name})`, err);
+                }
             }
-        }
 
-        pdf.save(`Bulk_Export_${filteredRecords.length}_Records.pdf`);
-        setExportProgress('');
-        setIsExporting(false);
-        setRecordIndex(0); 
+            pdf.save(`Bulk_Export_${records.length}_Records.pdf`);
+        } catch (err) {
+            console.error("Bulk export failed:", err);
+            alert("Bulk export failed: " + (err && err.message ? err.message : err));
+        } finally {
+            setExportProgress('');
+            setIsExporting(false);
+            setRecordIndex(savedIndex);
+        }
     };
 
     // 6. RENDER HELPERS
@@ -1122,17 +1159,24 @@ function UpgradedPageDesigner() {
                 linkUrl = safeGetCellValueAsString(currentRecord, table, el.fieldId);
             }
 
+            // Render as a real <img>, not a CSS background. html2canvas rasterizes a
+            // background SVG at the element's small on-screen box and then upscales that
+            // bitmap (blurry). An <img> keeps the SVG's large intrinsic size, so the
+            // browser re-rasterizes it crisply when html2canvas draws it at EXPORT_SCALE.
             return (
-                <div 
+                <img
                     data-link-url={linkUrl}
+                    src={iconSrc}
+                    alt=""
+                    draggable={false}
                     style={{
-                        width: '100%', 
-                        height: '100%', 
-                        backgroundImage: `url("${iconSrc}")`,
-                        backgroundSize: 'contain',
-                        backgroundPosition: 'center',
-                        backgroundRepeat: 'no-repeat'
-                    }} 
+                        width: '100%',
+                        height: '100%',
+                        objectFit: 'contain',
+                        objectPosition: 'center',
+                        display: 'block',
+                        pointerEvents: 'none'
+                    }}
                 />
             );
         }
@@ -1417,7 +1461,7 @@ function UpgradedPageDesigner() {
                                             {currentRecord && activeElement.fieldId && (
                                                 <Box marginTop={2} padding={2} backgroundColor="#f0f0f0" borderRadius="default">
                                                     <Text size="xsmall" textColor="light">Current Value:</Text>
-                                                    <Text truncate>{currentRecord.getCellValueAsString(activeElement.fieldId) || "(Empty)"}</Text>
+                                                    <Text truncate>{safeGetCellValueAsString(currentRecord, table, activeElement.fieldId) || "(Empty)"}</Text>
                                                 </Box>
                                             )}
                                             
@@ -1788,9 +1832,12 @@ function UpgradedPageDesigner() {
                                 content = renderElementContent(el);
                             }
 
+                            const nodeRef = getNodeRef(el.id);
+
                             return (
                                 <Draggable
                                     key={el.id}
+                                    nodeRef={nodeRef}
                                     position={{x: visualX, y: visualY}}
                                     onStart={(e, data) => handleDrag(e, data, el.id)}
                                     onDrag={(e, data) => handleDrag(e, data, el.id)}
@@ -1801,6 +1848,7 @@ function UpgradedPageDesigner() {
                                     disabled={selectedStackChildId !== null && el.id === selectedElementId} 
                                 >
                                     <div
+                                        ref={nodeRef}
                                         style={{
                                             ...el.style,
                                             width: visualWidth,
