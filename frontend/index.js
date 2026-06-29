@@ -125,6 +125,29 @@ const DEFAULT_ELEMENT_STYLE = {
     zIndex: 1,
 };
 
+// Curated, modern typefaces. `google` is the Google Fonts css2 family spec used to
+// build the stylesheet link (null = system font, no fetch). `value` is the CSS
+// font-family applied to elements. Add/remove here and both the loader and the
+// pickers update automatically.
+const FONT_CATALOG = [
+    { value: 'Helvetica, Arial, sans-serif',     label: 'Helvetica (system)',  google: null },
+    { value: '"Times New Roman", Times, serif',  label: 'Times (system)',      google: null },
+    { value: '"Inter", sans-serif',              label: 'Inter',               google: 'Inter:wght@400;500;700' },
+    { value: '"Roboto", sans-serif',             label: 'Roboto',              google: 'Roboto:wght@400;500;700' },
+    { value: '"Manrope", sans-serif',            label: 'Manrope',             google: 'Manrope:wght@400;500;700' },
+    { value: '"Poppins", sans-serif',            label: 'Poppins',             google: 'Poppins:wght@400;500;700' },
+    { value: '"Montserrat", sans-serif',         label: 'Montserrat',          google: 'Montserrat:wght@400;500;700' },
+    { value: '"DM Sans", sans-serif',            label: 'DM Sans',             google: 'DM+Sans:wght@400;500;700' },
+    { value: '"Space Grotesk", sans-serif',      label: 'Space Grotesk',       google: 'Space+Grotesk:wght@400;500;700' },
+    { value: '"Sora", sans-serif',               label: 'Sora',                google: 'Sora:wght@400;500;700' },
+    { value: '"Outfit", sans-serif',             label: 'Outfit',              google: 'Outfit:wght@400;500;700' },
+    { value: '"Archivo", sans-serif',            label: 'Archivo',             google: 'Archivo:wght@400;500;700' },
+    { value: '"Oswald", sans-serif',             label: 'Oswald (condensed)',  google: 'Oswald:wght@400;500;700' },
+    { value: '"Bebas Neue", sans-serif',         label: 'Bebas Neue (display)', google: 'Bebas+Neue' },
+    { value: '"Anton", sans-serif',              label: 'Anton (display)',     google: 'Anton' },
+];
+const FONT_OPTIONS = FONT_CATALOG.map(f => ({ value: f.value, label: f.label }));
+
 const DEFAULT_PAGE_STYLE = {
     type: 'solid', 
     color1: '#ffffff',
@@ -155,6 +178,19 @@ const safeGetCellValueAsString = (record, table, fieldId) => {
     if (!record || !table || !fieldId) return '';
     if (!fieldExistsInTable(table, fieldId)) return '';
     try { return record.getCellValueAsString(fieldId); } catch { return ''; }
+};
+
+// Returns a record's value(s) for a field as an array of option/value NAMES.
+// Works across single-select (one name), multiple-select / linked (many names),
+// and plain text (the string itself). Used by the value-based roster filter.
+const getFieldValueNames = (record, table, fieldId) => {
+    if (!record || !fieldExistsInTable(table, fieldId)) return [];
+    let raw;
+    try { raw = record.getCellValue(fieldId); } catch { return []; }
+    if (raw == null) return [];
+    if (Array.isArray(raw)) return raw.map(v => (v && typeof v === 'object' ? v.name : v)).filter(x => typeof x === 'string');
+    if (typeof raw === 'object') return typeof raw.name === 'string' ? [raw.name] : [];
+    return [String(raw)];
 };
 
 // Validate template elements against the actual table.
@@ -288,6 +324,19 @@ function UpgradedPageDesigner() {
     const rawPageStyle = globalConfig.get('pageStyle');
     const pageStyle = rawPageStyle ? { ...DEFAULT_PAGE_STYLE, ...rawPageStyle } : DEFAULT_PAGE_STYLE;
 
+    // Persisted value-based record filter, e.g. { fieldId, values: ['Shortlist','Ready'] }.
+    // Saved with the template so the roster auto-scopes on load. null = no restriction.
+    const rawRosterFilter = globalConfig.get('rosterFilter');
+    const rosterFilter = (rawRosterFilter && rawRosterFilter.fieldId) ? rawRosterFilter : null;
+    const updateRosterFilter = async (next) => {
+        try {
+            await globalConfig.setAsync('rosterFilter', next);
+        } catch (err) {
+            console.warn("Could not save roster filter", err);
+            alert("Couldn't save the roster filter. You may need creator permissions.");
+        }
+    };
+
     // --- LOCAL UI STATE ---
     const storedTableId = globalConfig.get('selectedTableId');
     const defaultTableId = base.tables.length > 0 ? base.tables[0].id : null;
@@ -381,18 +430,56 @@ function UpgradedPageDesigner() {
     
     // 1. MULTI-FILTER LOGIC — all active filters are ANDed together
     const activeFilters = filters.filter(f => f.fieldId && f.keyword.trim());
+
+    // Value-based roster filter. Only restricts when it points at a field that
+    // exists in THIS table AND has at least one value selected — otherwise it is
+    // ignored (so loading a template whose filter field is from another base, or
+    // selecting no values, never hides the entire roster by surprise).
+    const rosterFilterActive = !!(rosterFilter
+        && fieldExistsInTable(table, rosterFilter.fieldId)
+        && Array.isArray(rosterFilter.values)
+        && rosterFilter.values.length > 0);
+
     const filteredRecords = records ? records.filter(record => {
-        return activeFilters.every(f => {
+        const passesKeyword = activeFilters.every(f => {
             const cellValue = safeGetCellValueAsString(record, table, f.fieldId);
             return cellValue.toLowerCase().includes(f.keyword.toLowerCase());
         });
+        if (!passesKeyword) return false;
+        if (rosterFilterActive) {
+            const names = getFieldValueNames(record, table, rosterFilter.fieldId);
+            if (!names.some(n => rosterFilter.values.includes(n))) return false;
+        }
+        return true;
     }) : [];
 
     const currentRecord = filteredRecords[recordIndex];
 
+    // Roster filter panel data: the chosen field + its selectable values.
+    const rosterFilterField = (rosterFilter && fieldExistsInTable(table, rosterFilter.fieldId))
+        ? table.getFieldByIdIfExists(rosterFilter.fieldId) : null;
+    const rosterFilterValues = (rosterFilter && Array.isArray(rosterFilter.values)) ? rosterFilter.values : [];
+    let rosterAvailableValues = [];
+    if (rosterFilterField) {
+        const choices = (rosterFilterField.options && Array.isArray(rosterFilterField.options.choices))
+            ? rosterFilterField.options.choices : null;
+        if (choices) {
+            rosterAvailableValues = choices.map(c => c.name);
+        } else if (records) {
+            rosterAvailableValues = [...new Set(records.flatMap(r => getFieldValueNames(r, table, rosterFilter.fieldId)))].sort();
+        }
+    }
+    const setRosterFilterField = (field) => updateRosterFilter(field ? { fieldId: field.id, values: [] } : null);
+    const toggleRosterValue = (value) => {
+        if (!rosterFilter) return;
+        const exists = rosterFilterValues.includes(value);
+        const nextValues = exists ? rosterFilterValues.filter(v => v !== value) : [...rosterFilterValues, value];
+        updateRosterFilter({ fieldId: rosterFilter.fieldId, values: nextValues });
+    };
+
     useEffect(() => {
         setRecordIndex(0);
-    }, [JSON.stringify(filters), sortFieldId, sortDirection]);
+    }, [JSON.stringify(filters), sortFieldId, sortDirection, JSON.stringify(rosterFilter)]);
 
     const addFilter = () => {
         setFilters(prev => [...prev, { id: Date.now().toString(), fieldId: null, keyword: '' }]);
@@ -449,12 +536,16 @@ function UpgradedPageDesigner() {
         }
     };
 
-    // LOAD FONTS
+    // LOAD FONTS — build the Google Fonts request from FONT_CATALOG so every option
+    // in the pickers is actually available (the old loader only fetched 3 of them,
+    // so picking any other font silently fell back to a system face in the PDF).
     useEffect(() => {
+        const families = FONT_CATALOG.filter(f => f.google).map(f => 'family=' + f.google).join('&');
         const link = document.createElement('link');
-        link.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Oswald:wght@400;700&family=Roboto:wght@400;700&display=swap';
         link.rel = 'stylesheet';
+        link.href = `https://fonts.googleapis.com/css2?${families}&display=swap`;
         document.head.appendChild(link);
+        return () => { try { document.head.removeChild(link); } catch (e) { /* ignore */ } };
     }, []);
 
     const pageRef = useRef(null);
@@ -488,6 +579,20 @@ function UpgradedPageDesigner() {
                 setSessionImage(updates.imageUrl);
             }
         }
+    };
+
+    // Set the font on every element (and every stack child) at once — the fast way
+    // to try a whole-card look. Leaves all other styling untouched.
+    const applyFontToAll = (font) => {
+        const f = font || DEFAULT_ELEMENT_STYLE.fontFamily;
+        const newElements = elements.map(el => {
+            const updated = { ...el, style: { ...el.style, fontFamily: f } };
+            if (Array.isArray(el.children) && el.children.length > 0) {
+                updated.children = el.children.map(c => ({ ...c, style: { ...c.style, fontFamily: f } }));
+            }
+            return updated;
+        });
+        updateElements(newElements);
     };
 
     const handleFileUpload = (e) => {
@@ -560,6 +665,9 @@ function UpgradedPageDesigner() {
             children: [],
             style: { 
                 ...DEFAULT_ELEMENT_STYLE,
+                // New elements inherit the page's base font (if one is set) so the
+                // card stays typographically consistent as you add to it.
+                fontFamily: pageStyle.fontFamily || DEFAULT_ELEMENT_STYLE.fontFamily,
                 // Default stack background is transparent, no border
                 borderWidth: isStack ? '1px' : '0px',
                 borderColor: isStack ? '#cccccc' : 'transparent',
@@ -986,6 +1094,11 @@ function UpgradedPageDesigner() {
     // and rasterized vectors), at the cost of memory/time. cropCanvas MUST use the
     // same value or the crop will be misaligned.
     const EXPORT_SCALE = 3;
+    // Bulk renders many pages, so it trades a little crispness for speed + memory:
+    // scale 2 is ~2.25× fewer pixels than scale 3 — the single biggest lever on
+    // render time AND PDF size. Raise toward 3 for sharper pages, drop to 1.5 for
+    // a faster, lighter run on a large roster.
+    const BULK_EXPORT_SCALE = 2;
 
     // Wait until the browser has committed and painted the latest render, and every
     // <img> inside the container has decoded. This replaces the old fixed sleep(1200)
@@ -994,7 +1107,7 @@ function UpgradedPageDesigner() {
     const nextFrame = () => new Promise(res => requestAnimationFrame(() => requestAnimationFrame(res)));
 
     const waitForRenderReady = async (container) => {
-        await nextFrame(); // let React commit + the browser lay out the new record
+        await nextFrame(); // let React commit + the browser lay out and paint the new record
         if (container) {
             const imgs = Array.from(container.querySelectorAll('img'));
             await Promise.all(imgs.map(img => {
@@ -1005,14 +1118,14 @@ function UpgradedPageDesigner() {
         if (document.fonts && document.fonts.ready) {
             try { await document.fonts.ready; } catch (e) { /* ignore */ }
         }
-        await nextFrame(); // one more paint for safety
     };
 
     // Crop the html2canvas output to exactly the page box (removes scroll overflow).
-    const cropCanvas = (sourceCanvas, width, height) => {
+    const cropCanvas = (sourceCanvas, width, height, scale) => {
+        const s = scale || EXPORT_SCALE;
         const newCanvas = document.createElement('canvas');
-        newCanvas.width = width * EXPORT_SCALE;
-        newCanvas.height = height * EXPORT_SCALE;
+        newCanvas.width = width * s;
+        newCanvas.height = height * s;
         const ctx = newCanvas.getContext('2d');
         ctx.drawImage(sourceCanvas, 0, 0, newCanvas.width, newCanvas.height, 0, 0, newCanvas.width, newCanvas.height);
         return newCanvas;
@@ -1040,28 +1153,39 @@ function UpgradedPageDesigner() {
             return urls;
         };
 
-        const allUrls = [...new Set(recordsToPrint.flatMap(urlsForRecord))];
-        for (const url of allUrls) {
-            if (currentCache[url] || cacheUpdates[url]) continue;
-            const base64 = await fetchImageAsBase64(url);
-            if (base64) {
-                cacheUpdates[url] = base64;
-                try { const im = new Image(); im.src = base64; await im.decode(); } catch (e) { /* ignore */ }
+        // Fetch + decode with bounded concurrency (sequential awaits made the
+        // "Preparing images" phase scale linearly with roster size). 6 workers pull
+        // from a shared, already-deduped queue.
+        const allUrls = [...new Set(recordsToPrint.flatMap(urlsForRecord))].filter(u => !currentCache[u]);
+        const CONCURRENCY = 6;
+        let idx = 0;
+        const worker = async () => {
+            while (idx < allUrls.length) {
+                const url = allUrls[idx++];
+                const base64 = await fetchImageAsBase64(url);
+                if (base64) {
+                    cacheUpdates[url] = base64;
+                    try { const im = new Image(); im.src = base64; await im.decode(); } catch (e) { /* ignore */ }
+                }
             }
-        }
+        };
+        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, allUrls.length) }, worker));
         if (Object.keys(cacheUpdates).length > 0) {
             setImageCache(prev => ({ ...prev, ...cacheUpdates }));
         }
     };
 
     // Capture the live page container to a cropped PNG data URL.
-    const capturePageImage = async () => {
+    // format: 'PNG' (lossless, large — fine for a single card) or 'JPEG' (much
+    // smaller — required for bulk so the in-memory PDF string stays under V8's
+    // max length). JPEG has no alpha, so fill transparent areas with white.
+    const capturePageImage = async (format = 'PNG', quality = 0.9, scale = EXPORT_SCALE) => {
         await waitForRenderReady(pageRef.current);
         const canvas = await html2canvas(pageRef.current, {
-            scale: EXPORT_SCALE,
+            scale: scale,
             useCORS: true,
             allowTaint: false,
-            backgroundColor: null,
+            backgroundColor: format === 'JPEG' ? '#ffffff' : null,
             width: pageStyle.width,
             height: pageStyle.height,
             windowWidth: pageStyle.width,
@@ -1069,10 +1193,14 @@ function UpgradedPageDesigner() {
             scrollX: 0,
             scrollY: 0,
             x: 0,
-            y: 0
+            y: 0,
+            imageTimeout: 0,   // images are pre-decoded; don't sit in load-wait loops
+            logging: false
         });
-        const cropped = cropCanvas(canvas, pageStyle.width, pageStyle.height);
-        return cropped.toDataURL('image/png');
+        const cropped = cropCanvas(canvas, pageStyle.width, pageStyle.height, scale);
+        return format === 'JPEG'
+            ? cropped.toDataURL('image/jpeg', quality)
+            : cropped.toDataURL('image/png');
     };
 
     // Overlay real (vector, clickable) hyperlinks onto the current PDF page by scanning
@@ -1128,15 +1256,18 @@ function UpgradedPageDesigner() {
             await prepareAllRecordsForPrint(records);
 
             const orientation = pageStyle.width > pageStyle.height ? 'l' : 'p';
-            const pdf = new jsPDF({ orientation, unit: 'px', format: [pageStyle.width, pageStyle.height] });
+            // compress: true deflates the PDF's content streams. Pages are stored as
+            // JPEG (see below) to keep the whole document well under the in-memory
+            // string-length ceiling that a full-roster PNG export blows past.
+            const pdf = new jsPDF({ orientation, unit: 'px', format: [pageStyle.width, pageStyle.height], compress: true });
 
             for (let i = 0; i < records.length; i++) {
                 setExportProgress(`Rendering ${i + 1} of ${records.length}`);
                 setRecordIndex(i);
                 try {
-                    const imgData = await capturePageImage(); // waits for real readiness, not a timer
+                    const imgData = await capturePageImage('JPEG', 0.9, BULK_EXPORT_SCALE); // lighter scale + JPEG
                     if (i > 0) pdf.addPage([pageStyle.width, pageStyle.height], orientation);
-                    pdf.addImage(imgData, 'PNG', 0, 0, pageStyle.width, pageStyle.height, undefined, 'FAST');
+                    pdf.addImage(imgData, 'JPEG', 0, 0, pageStyle.width, pageStyle.height, undefined, 'FAST');
                     addPageLinks(pdf, i + 1);
                 } catch (err) {
                     console.error(`Error exporting record ${i} (${records[i] && records[i].name})`, err);
@@ -1314,6 +1445,24 @@ function UpgradedPageDesigner() {
                                 </Box>
                             </Box>
 
+                            <Heading size="xsmall" marginBottom={2}>Typography</Heading>
+                            <FormField label="Base font (new elements + quick apply)">
+                                <Select
+                                    options={FONT_OPTIONS}
+                                    value={pageStyle.fontFamily || DEFAULT_ELEMENT_STYLE.fontFamily}
+                                    onChange={val => updatePageStyle({ fontFamily: val })}
+                                />
+                            </FormField>
+                            <Button
+                                icon="font"
+                                variant="default"
+                                size="small"
+                                marginBottom={3}
+                                onClick={() => applyFontToAll(pageStyle.fontFamily)}
+                            >
+                                Apply base font to all elements
+                            </Button>
+
                             <Heading size="xsmall" marginBottom={2}>Page Background</Heading>
                             <FormField label="Background Type">
                                 <Select 
@@ -1374,6 +1523,52 @@ function UpgradedPageDesigner() {
 
                     {editMode === 'elements' && !selectedElementId && (
                         <>
+                            {/* ── ROSTER FILTER (saved with template) ── */}
+                            <Heading size="xsmall" marginBottom={2}>Roster Filter</Heading>
+                            <Text size="small" textColor="light" marginBottom={2}>
+                                Limit which records load by a field's value (e.g. only Shortlist and Ready). Persists across all templates — loading a template won't change it.
+                            </Text>
+                            <FormField label="Filter field">
+                                <FieldPicker
+                                    table={table}
+                                    field={rosterFilterField}
+                                    onChange={setRosterFilterField}
+                                    shouldAllowPickingNone={true}
+                                    placeholder="No filter — show all"
+                                />
+                            </FormField>
+                            {rosterFilterField && (
+                                <Box marginBottom={3}>
+                                    <Box display="flex" justifyContent="space-between" alignItems="center" marginBottom={1}>
+                                        <Text size="small" textColor="light">Include values</Text>
+                                        <Box display="flex" gap={1}>
+                                            <Button size="small" variant="default" onClick={() => updateRosterFilter({ fieldId: rosterFilter.fieldId, values: rosterAvailableValues })}>All</Button>
+                                            <Button size="small" variant="default" onClick={() => updateRosterFilter({ fieldId: rosterFilter.fieldId, values: [] })}>None</Button>
+                                        </Box>
+                                    </Box>
+                                    {rosterAvailableValues.length === 0 ? (
+                                        <Text size="small" textColor="light">No values found for this field.</Text>
+                                    ) : (
+                                        <Box border="default" borderRadius="default" padding={2} backgroundColor="white" style={{ maxHeight: '180px', overflowY: 'auto' }}>
+                                            {rosterAvailableValues.map(val => (
+                                                <Switch
+                                                    key={val}
+                                                    label={val}
+                                                    value={rosterFilterValues.includes(val)}
+                                                    onChange={() => toggleRosterValue(val)}
+                                                    marginBottom={1}
+                                                />
+                                            ))}
+                                        </Box>
+                                    )}
+                                    {rosterFilterActive && (
+                                        <Text size="small" textColor="light" marginTop={1}>
+                                            Showing records where {rosterFilterField.name} matches {rosterFilterValues.length} selected value(s) — {filteredRecords.length} of {records ? records.length : 0}.
+                                        </Text>
+                                    )}
+                                </Box>
+                            )}
+
                             {/* ── TEMPLATE MANAGEMENT ── */}
                             <Heading size="xsmall" marginBottom={2}>Template</Heading>
                             <Box display="flex" flexDirection="column" gap={2} marginBottom={1}>
@@ -1671,13 +1866,7 @@ function UpgradedPageDesigner() {
                                     <Box marginTop={2}>
                                         <Label>Font Family</Label>
                                         <Select 
-                                            options={[
-                                                {value: 'Helvetica, Arial, sans-serif', label: 'Standard Sans'},
-                                                {value: '"Times New Roman", Times, serif', label: 'Standard Serif'},
-                                                {value: '"Inter", sans-serif', label: 'Inter (Google)'},
-                                                {value: '"Roboto", sans-serif', label: 'Roboto (Google)'},
-                                                {value: '"Oswald", sans-serif', label: 'Oswald (Google)'},
-                                            ]}
+                                            options={FONT_OPTIONS}
                                             value={activeElement.style.fontFamily}
                                             onChange={val => updateSelectedStyle('fontFamily', val)}
                                         />
