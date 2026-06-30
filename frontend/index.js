@@ -193,6 +193,37 @@ const getFieldValueNames = (record, table, fieldId) => {
     return [String(raw)];
 };
 
+// Decode the literal escape sequences a user can type into a find/replace box
+// (\n -> newline, \t -> tab, \\ -> backslash) so they can insert line breaks.
+const decodeEscapes = (s) => {
+    if (!s) return '';
+    let out = '';
+    for (let i = 0; i < s.length; i++) {
+        if (s[i] === '\\' && i + 1 < s.length) {
+            const n = s[i + 1];
+            if (n === 'n') { out += '\n'; i++; continue; }
+            if (n === 't') { out += '\t'; i++; continue; }
+            if (n === '\\') { out += '\\'; i++; continue; }
+        }
+        out += s[i];
+    }
+    return out;
+};
+
+// Apply an element's find/replace rules to its displayed text. Literal (not regex)
+// replacement of all occurrences, in order. \n in either side becomes a real break.
+const applyReplacements = (text, rules) => {
+    if (text == null || !Array.isArray(rules) || rules.length === 0) return text;
+    let out = String(text);
+    for (const r of rules) {
+        if (!r) continue;
+        const find = decodeEscapes(r.find);
+        if (find === '') continue; // empty find would explode into every gap
+        out = out.split(find).join(decodeEscapes(r.replace || ''));
+    }
+    return out;
+};
+
 // Validate template elements against the actual table.
 // Keeps fieldIds that exist in THIS table, nulls only those that don't.
 // This way the template works perfectly in its own base, and degrades gracefully
@@ -293,7 +324,7 @@ const generateBlurredDataUrl = (base64, { width = 240, blur = 14 } = {}) => {
 // paints — which means the PDF capture (which waits for paint) always sees the
 // final size, on every record in a bulk export.
 const AUTOFIT_MIN_PX = 5;
-function AutoFitText({ text, baseFontSize, boxW, boxH }) {
+function AutoFitText({ text, baseFontSize, boxW, boxH, whiteSpace }) {
     const ref = useRef(null);
     const startSize = parseFloat(baseFontSize) || 14;
     const [fontSize, setFontSize] = useState(startSize);
@@ -361,6 +392,7 @@ function AutoFitText({ text, baseFontSize, boxW, boxH }) {
                 height: '100%',
                 overflow: 'hidden',
                 wordWrap: 'break-word',
+                whiteSpace: whiteSpace || 'normal',
                 fontSize: fontSize + 'px'
             }}
         >
@@ -425,11 +457,24 @@ function UpgradedPageDesigner() {
     const globalConfig = useGlobalConfig();
     
     // --- SAVED DATA ---
-    const rawElements = globalConfig.get('elements');
+    // Roster vs. standalone title page. The title page is a single slide prepended to
+    // the bulk export; it reuses the ENTIRE editor by swapping which globalConfig keys
+    // back the elements + page style. exportMode forces a render target during export
+    // regardless of what the editor is currently showing.
+    const [designMode, setDesignMode] = useState('roster'); // 'roster' | 'title'
+    const [exportMode, setExportMode] = useState(null);      // null | 'roster' | 'title'
+    const activeMode = exportMode || designMode;
+    const elementsKey = activeMode === 'title' ? 'titleElements' : 'elements';
+    const pageStyleKey = activeMode === 'title' ? 'titlePageStyle' : 'pageStyle';
+
+    const rawElements = globalConfig.get(elementsKey);
     const elements = Array.isArray(rawElements) ? rawElements : [];
-    
-    const rawPageStyle = globalConfig.get('pageStyle');
+
+    const rawPageStyle = globalConfig.get(pageStyleKey);
     const pageStyle = rawPageStyle ? { ...DEFAULT_PAGE_STYLE, ...rawPageStyle } : DEFAULT_PAGE_STYLE;
+
+    const titlePageEnabled = globalConfig.get('titlePageEnabled') !== false; // default on once created
+    const titlePageExists = !!globalConfig.get('titlePageStyle');
 
     // Persisted value-based record filter, e.g. { fieldId, values: ['Shortlist','Ready'] }.
     // Saved with the template so the roster auto-scopes on load. null = no restriction.
@@ -688,7 +733,7 @@ function UpgradedPageDesigner() {
         if (h.past.length > 60) h.past.shift();
         h.future = [];
         setHistoryTick(t => t + 1);
-        globalConfig.setAsync('elements', newElements);
+        globalConfig.setAsync(elementsKey, newElements);
     };
 
     const undo = () => {
@@ -697,7 +742,7 @@ function UpgradedPageDesigner() {
         const prev = h.past.pop();
         h.future.push(JSON.stringify(elements));
         setHistoryTick(t => t + 1);
-        globalConfig.setAsync('elements', JSON.parse(prev));
+        globalConfig.setAsync(elementsKey, JSON.parse(prev));
         setSelectedElementId(null); setSelectedStackChildId(null); setSelectedIds([]);
     };
 
@@ -707,7 +752,7 @@ function UpgradedPageDesigner() {
         const next = h.future.pop();
         h.past.push(JSON.stringify(elements));
         setHistoryTick(t => t + 1);
-        globalConfig.setAsync('elements', JSON.parse(next));
+        globalConfig.setAsync(elementsKey, JSON.parse(next));
         setSelectedElementId(null); setSelectedStackChildId(null); setSelectedIds([]);
     };
 
@@ -732,7 +777,7 @@ function UpgradedPageDesigner() {
     const updatePageStyle = async (updates) => {
         const newStyle = { ...pageStyle, ...updates };
         try {
-            await globalConfig.setAsync('pageStyle', newStyle);
+            await globalConfig.setAsync(pageStyleKey, newStyle);
         } catch (err) {
             console.warn("Could not save to globalConfig", err);
             if (updates.imageUrl) {
@@ -740,6 +785,40 @@ function UpgradedPageDesigner() {
                 setSessionImage(updates.imageUrl);
             }
         }
+    };
+
+    const setTitlePageEnabled = async (val) => {
+        try { await globalConfig.setAsync('titlePageEnabled', !!val); }
+        catch (err) { console.warn("Could not save title-page toggle", err); }
+    };
+
+    // Switch the editor between the roster card and the standalone title page. The
+    // title page is initialized (once) from the current roster page so its dimensions
+    // match. History is per-mode, so it's reset on switch to avoid cross-contamination.
+    const switchMode = async (mode) => {
+        if (mode === 'title') {
+            try {
+                if (!globalConfig.get('titlePageStyle')) {
+                    // Match the roster page's size + base font, but start with a clean solid
+                    // background so we don't duplicate the roster's heavy baked image into
+                    // globalConfig (which could blow the size limit). User sets bg in the panel.
+                    const base = globalConfig.get('pageStyle') || {};
+                    await globalConfig.setAsync('titlePageStyle', {
+                        ...DEFAULT_PAGE_STYLE,
+                        type: 'solid',
+                        width: base.width || DEFAULT_PAGE_WIDTH,
+                        height: base.height || DEFAULT_PAGE_HEIGHT,
+                        fontFamily: base.fontFamily || DEFAULT_ELEMENT_STYLE.fontFamily
+                    });
+                }
+                if (!Array.isArray(globalConfig.get('titleElements'))) await globalConfig.setAsync('titleElements', []);
+                if (globalConfig.get('titlePageEnabled') === undefined) await globalConfig.setAsync('titlePageEnabled', true);
+            } catch (err) { console.warn("Could not initialize title page", err); }
+        }
+        historyRef.current = { past: [], future: [] };
+        setHistoryTick(t => t + 1);
+        setSelectedElementId(null); setSelectedStackChildId(null); setSelectedIds([]);
+        setDesignMode(mode);
     };
 
     // Set the font on every element (and every stack child) at once — the fast way
@@ -900,6 +979,23 @@ function UpgradedPageDesigner() {
         if(selectedStackChildId === childId) setSelectedStackChildId(null);
     };
 
+    // Reorder a child within its stack. dir = -1 (toward start) or +1 (toward end).
+    const moveStackItem = (childId, dir) => {
+        if (!selectedElementId) return;
+        const newElements = elements.map(el => {
+            if (el.id === selectedElementId && el.type === 'stack') {
+                const children = [...(el.children || [])];
+                const i = children.findIndex(c => c.id === childId);
+                const j = i + dir;
+                if (i === -1 || j < 0 || j >= children.length) return el;
+                [children[i], children[j]] = [children[j], children[i]];
+                return { ...el, children };
+            }
+            return el;
+        });
+        updateElements(newElements);
+    };
+
     const updateStackItem = (childId, updates) => {
         if (!selectedElementId) return;
         const newElements = elements.map(el => {
@@ -963,10 +1059,16 @@ function UpgradedPageDesigner() {
     };
 
     // Downscale + store an uploaded image on the selected element (keeps globalConfig
-    // size sane — full-res data URLs can be multiple MB).
+    // size sane — full-res data URLs can be multiple MB). Encodes as PNG when the
+    // element is flagged transparent (or the source file is a PNG and no choice was
+    // made yet), so transparent images keep their alpha instead of flattening to black.
     const handleStaticImageUpload = (e) => {
         const file = e.target.files[0];
         if (!file) return;
+        const sel = elements.find(el => el.id === selectedElementId);
+        const wantPng = (sel && typeof sel.transparentPng === 'boolean')
+            ? sel.transparentPng
+            : (file.type === 'image/png');
         const reader = new FileReader();
         reader.onload = (f) => {
             const img = new Image();
@@ -978,13 +1080,32 @@ function UpgradedPageDesigner() {
                 const c = document.createElement('canvas');
                 c.width = w; c.height = h;
                 c.getContext('2d').drawImage(img, 0, 0, w, h);
-                updateSelected({ staticImage: c.toDataURL('image/jpeg', 0.85) });
+                const dataUrl = wantPng ? c.toDataURL('image/png') : c.toDataURL('image/jpeg', 0.85);
+                updateSelected({ staticImage: dataUrl, transparentPng: wantPng });
             };
-            img.onerror = () => updateSelected({ staticImage: f.target.result });
+            img.onerror = () => updateSelected({ staticImage: f.target.result, transparentPng: wantPng });
             img.src = f.target.result;
         };
         reader.readAsDataURL(file);
         e.target.value = ''; // allow re-uploading the same file
+    };
+
+    // Re-encode the already-stored static image to the chosen format when the toggle
+    // flips. Note: alpha can't be recovered from an image already saved as JPEG — to
+    // get real transparency, turn this on and re-upload the source PNG.
+    const reencodeStaticImage = (el, toPng) => {
+        if (!el || !el.staticImage) { updateSelected({ transparentPng: toPng }); return; }
+        const img = new Image();
+        img.onload = () => {
+            const c = document.createElement('canvas');
+            c.width = img.naturalWidth || img.width;
+            c.height = img.naturalHeight || img.height;
+            c.getContext('2d').drawImage(img, 0, 0);
+            const dataUrl = toPng ? c.toDataURL('image/png') : c.toDataURL('image/jpeg', 0.85);
+            updateSelected({ staticImage: dataUrl, transparentPng: toPng });
+        };
+        img.onerror = () => updateSelected({ transparentPng: toPng });
+        img.src = el.staticImage;
     };
 
     // ── MULTI-SELECT ORGANIZE ──────────────────────────────────────────────
@@ -1174,9 +1295,12 @@ function UpgradedPageDesigner() {
     const saveAsDefaultTemplate = async () => {
         if (!confirm("Save the current layout as the default template?\n\nThis will be used as the starting point for any new install of this block in your workspace.")) return;
         try {
+            // Always the roster card, even if the title-page editor is open.
+            const rosterElements = Array.isArray(globalConfig.get('elements')) ? globalConfig.get('elements') : [];
+            const rosterPageStyle = globalConfig.get('pageStyle') ? { ...DEFAULT_PAGE_STYLE, ...globalConfig.get('pageStyle') } : DEFAULT_PAGE_STYLE;
             await globalConfig.setAsync('defaultTemplate', {
-                elements: elements,
-                pageStyle: pageStyle
+                elements: rosterElements,
+                pageStyle: rosterPageStyle
             });
             alert("Default template saved!\n\nNew installs of this block will start with this layout.");
         } catch (err) {
@@ -1189,7 +1313,9 @@ function UpgradedPageDesigner() {
     // Drop this file into your project root and redeploy to bake it
     // into the bundle as the permanent static fallback.
     const exportTemplateJSON = () => {
-        const snapshot = { elements, pageStyle };
+        const rosterElements = Array.isArray(globalConfig.get('elements')) ? globalConfig.get('elements') : [];
+        const rosterPageStyle = globalConfig.get('pageStyle') ? { ...DEFAULT_PAGE_STYLE, ...globalConfig.get('pageStyle') } : DEFAULT_PAGE_STYLE;
+        const snapshot = { elements: rosterElements, pageStyle: rosterPageStyle };
         const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -1610,17 +1736,18 @@ function UpgradedPageDesigner() {
     // format: 'PNG' (lossless, large — fine for a single card) or 'JPEG' (much
     // smaller — required for bulk so the in-memory PDF string stays under V8's
     // max length). JPEG has no alpha, so fill transparent areas with white.
-    const capturePageImage = async (format = 'PNG', quality = 0.9, scale = EXPORT_SCALE) => {
+    const capturePageImage = async (format = 'PNG', quality = 0.9, scale = EXPORT_SCALE, ps = null) => {
+        const style = ps || pageStyle;
         await waitForRenderReady(pageRef.current);
         const canvas = await html2canvas(pageRef.current, {
             scale: scale,
             useCORS: true,
             allowTaint: false,
             backgroundColor: format === 'JPEG' ? '#ffffff' : null,
-            width: pageStyle.width,
-            height: pageStyle.height,
-            windowWidth: pageStyle.width,
-            windowHeight: pageStyle.height,
+            width: style.width,
+            height: style.height,
+            windowWidth: style.width,
+            windowHeight: style.height,
             scrollX: 0,
             scrollY: 0,
             x: 0,
@@ -1628,7 +1755,7 @@ function UpgradedPageDesigner() {
             imageTimeout: 0,   // images are pre-decoded; don't sit in load-wait loops
             logging: false
         });
-        const cropped = cropCanvas(canvas, pageStyle.width, pageStyle.height, scale);
+        const cropped = cropCanvas(canvas, style.width, style.height, scale);
         return format === 'JPEG'
             ? cropped.toDataURL('image/jpeg', quality)
             : cropped.toDataURL('image/png');
@@ -1651,16 +1778,22 @@ function UpgradedPageDesigner() {
     const generatePDF = async () => {
         if (!pageRef.current || !currentRecord) return;
         setIsExporting(true);
+        const forceRoster = designMode === 'title';
         try {
+            // Single export is always the current roster card, even if the title-page
+            // editor is open — force the roster render target first.
+            if (forceRoster) { setExportMode('roster'); await nextFrame(); await nextFrame(); }
+            const rosterPS = { ...DEFAULT_PAGE_STYLE, ...(globalConfig.get('pageStyle') || {}) };
+
             setExportProgress("Preparing images...");
             await prepareAllRecordsForPrint([currentRecord]);
 
             setExportProgress("Generating PDF...");
-            const orientation = pageStyle.width > pageStyle.height ? 'l' : 'p';
-            const pdf = new jsPDF({ orientation, unit: 'px', format: [pageStyle.width, pageStyle.height] });
+            const orientation = rosterPS.width > rosterPS.height ? 'l' : 'p';
+            const pdf = new jsPDF({ orientation, unit: 'px', format: [rosterPS.width, rosterPS.height] });
 
-            const imgData = await capturePageImage();
-            pdf.addImage(imgData, 'PNG', 0, 0, pageStyle.width, pageStyle.height, undefined, 'FAST');
+            const imgData = await capturePageImage('PNG', 0.9, EXPORT_SCALE, rosterPS);
+            pdf.addImage(imgData, 'PNG', 0, 0, rosterPS.width, rosterPS.height, undefined, 'FAST');
             addPageLinks(pdf);
 
             pdf.save(`Roster-${currentRecord.name}.pdf`);
@@ -1670,6 +1803,7 @@ function UpgradedPageDesigner() {
         } finally {
             setExportProgress('');
             setIsExporting(false);
+            if (forceRoster) setExportMode(null);
         }
     };
 
@@ -1681,25 +1815,54 @@ function UpgradedPageDesigner() {
         const records = filteredRecords;   // snapshot so the list can't shift mid-export
         const savedIndex = recordIndex;    // restore the user's view when we're done
         try {
-            // Fetch + decode every image once, up front. The loop below then never
+            // Fetch + decode every record image once, up front. The loop below then never
             // waits on the network — only on the (fast) per-record render.
             setExportProgress('Preparing images...');
             await prepareAllRecordsForPrint(records);
 
-            const orientation = pageStyle.width > pageStyle.height ? 'l' : 'p';
-            // compress: true deflates the PDF's content streams. Pages are stored as
-            // JPEG (see below) to keep the whole document well under the in-memory
-            // string-length ceiling that a full-roster PNG export blows past.
-            const pdf = new jsPDF({ orientation, unit: 'px', format: [pageStyle.width, pageStyle.height], compress: true });
+            // Read styles straight from globalConfig: this async function closed over a
+            // (now stale) reactive pageStyle, so we can't trust it once exportMode flips.
+            const rosterPS = { ...DEFAULT_PAGE_STYLE, ...(globalConfig.get('pageStyle') || {}) };
+            const titlePS = { ...DEFAULT_PAGE_STYLE, ...(globalConfig.get('titlePageStyle') || {}) };
+            const includeTitle = !!globalConfig.get('titlePageStyle') && globalConfig.get('titlePageEnabled') !== false;
 
+            const rosterOrientation = rosterPS.width > rosterPS.height ? 'l' : 'p';
+            const firstPS = includeTitle ? titlePS : rosterPS;
+            const firstOrientation = firstPS.width > firstPS.height ? 'l' : 'p';
+            const pdf = new jsPDF({ orientation: firstOrientation, unit: 'px', format: [firstPS.width, firstPS.height], compress: true });
+
+            let pageCount = 0;
+
+            // 1. TITLE PAGE — rendered once, standalone, as the first page.
+            if (includeTitle) {
+                setExportProgress('Rendering title page');
+                setExportMode('title');
+                await nextFrame(); await nextFrame();
+                try {
+                    const imgData = await capturePageImage('JPEG', 0.9, BULK_EXPORT_SCALE, titlePS);
+                    pdf.addImage(imgData, 'JPEG', 0, 0, titlePS.width, titlePS.height, undefined, 'FAST');
+                    addPageLinks(pdf, 1);
+                    pageCount = 1;
+                } catch (err) {
+                    console.error("Title page export failed", err);
+                }
+                setExportMode('roster');
+                await nextFrame(); await nextFrame();
+            } else {
+                setExportMode('roster');
+                await nextFrame();
+            }
+
+            // 2. ROSTER — one page per record.
             for (let i = 0; i < records.length; i++) {
                 setExportProgress(`Rendering ${i + 1} of ${records.length}`);
                 setRecordIndex(i);
                 try {
-                    const imgData = await capturePageImage('JPEG', 0.9, BULK_EXPORT_SCALE); // lighter scale + JPEG
-                    if (i > 0) pdf.addPage([pageStyle.width, pageStyle.height], orientation);
-                    pdf.addImage(imgData, 'JPEG', 0, 0, pageStyle.width, pageStyle.height, undefined, 'FAST');
-                    addPageLinks(pdf, i + 1);
+                    const imgData = await capturePageImage('JPEG', 0.9, BULK_EXPORT_SCALE, rosterPS); // lighter scale + JPEG
+                    if (pageCount > 0) pdf.addPage([rosterPS.width, rosterPS.height], rosterOrientation);
+                    pdf.addImage(imgData, 'JPEG', 0, 0, rosterPS.width, rosterPS.height, undefined, 'FAST');
+                    addPageLinks(pdf, pageCount + 1);
+                    pageCount++;
                 } catch (err) {
                     console.error(`Error exporting record ${i} (${records[i] && records[i].name})`, err);
                 }
@@ -1712,6 +1875,7 @@ function UpgradedPageDesigner() {
         } finally {
             setExportProgress('');
             setIsExporting(false);
+            setExportMode(null);
             setRecordIndex(savedIndex);
         }
     };
@@ -1749,6 +1913,12 @@ function UpgradedPageDesigner() {
                     textVal = safeGetCellValueAsString(currentRecord, table, el.fieldId);
                 }
             }
+            // Per-element find/replace (supports \n -> line break), applied live to
+            // whatever this display renders, for every record.
+            const hasRules = Array.isArray(el.replacements) && el.replacements.length > 0;
+            if (hasRules) textVal = applyReplacements(textVal, el.replacements);
+            // pre-wrap only when rules exist, so existing layouts are untouched.
+            const ws = hasRules ? 'pre-wrap' : undefined;
             if (el.autoFitText) {
                 return (
                     <AutoFitText
@@ -1756,11 +1926,12 @@ function UpgradedPageDesigner() {
                         baseFontSize={el.style && el.style.fontSize}
                         boxW={el.width}
                         boxH={el.height}
+                        whiteSpace={ws}
                     />
                 );
             }
             return (
-                <div style={{width: '100%', height: '100%', wordWrap: 'break-word', overflow: 'hidden'}}>
+                <div style={{width: '100%', height: '100%', wordWrap: 'break-word', overflow: 'hidden', whiteSpace: ws || 'normal'}}>
                     {textVal}
                 </div>
             );
@@ -1879,6 +2050,14 @@ function UpgradedPageDesigner() {
             
             {/* --- SIDEBAR --- */}
             <Box width="320px" borderRight="thick" display="flex" flexDirection="column" backgroundColor="#f9f9f9">
+                {designMode === 'title' && (
+                    <Box padding={2} backgroundColor="#fff4e5" borderBottom="thick" display="flex" justifyContent="space-between" alignItems="center">
+                        <Text size="small" fontWeight="bold">Editing title page</Text>
+                        <Button size="small" variant="primary" icon="chevronLeft" onClick={() => switchMode('roster')}>
+                            Back to roster
+                        </Button>
+                    </Box>
+                )}
                 <Box display="flex" borderBottom="thick" backgroundColor="white">
                     <Box 
                         flex="1" padding={3} textAlign="center" cursor="pointer"
@@ -1901,6 +2080,28 @@ function UpgradedPageDesigner() {
                 <Box flex="1" overflowY="auto" padding={3}>
                     {editMode === 'page' && (
                         <>
+                            <Box marginBottom={3} padding={2} border="thick" borderRadius="default" backgroundColor="white">
+                                <Heading size="xsmall" marginBottom={1}>Title Page</Heading>
+                                <Text size="xsmall" textColor="light" marginBottom={2}>
+                                    A standalone cover slide added to the front of the bulk PDF. It has its own layout and background and uses all the same tools.
+                                </Text>
+                                {designMode === 'roster' ? (
+                                    <Button icon="file" variant="primary" size="small" width="100%" marginBottom={2} onClick={() => switchMode('title')}>
+                                        Design title page
+                                    </Button>
+                                ) : (
+                                    <Button icon="chevronLeft" variant="default" size="small" width="100%" marginBottom={2} onClick={() => switchMode('roster')}>
+                                        Back to roster card
+                                    </Button>
+                                )}
+                                {titlePageExists && (
+                                    <Box display="flex" alignItems="center">
+                                        <Switch value={titlePageEnabled} onChange={setTitlePageEnabled} marginRight={2} />
+                                        <Text size="small">Include in bulk export</Text>
+                                    </Box>
+                                )}
+                            </Box>
+
                             <Heading size="xsmall" marginBottom={2}>Page Dimensions</Heading>
                             <Box display="flex" gap={2} marginBottom={3}>
                                 <Box flex="1">
@@ -2208,7 +2409,25 @@ function UpgradedPageDesigner() {
                                         >
                                             <Box display="flex" justifyContent="space-between" alignItems="center">
                                                 <Text fontWeight="bold">Item {idx + 1}: {child.displayMode || child.type}</Text>
-                                                <Icon name="edit" size={12} />
+                                                <Box display="flex" alignItems="center" gap={1}>
+                                                    <Button
+                                                        size="small"
+                                                        variant="default"
+                                                        icon="chevronUp"
+                                                        aria-label="Move up"
+                                                        disabled={idx === 0}
+                                                        onClick={(e) => { e.stopPropagation(); moveStackItem(child.id, -1); }}
+                                                    />
+                                                    <Button
+                                                        size="small"
+                                                        variant="default"
+                                                        icon="chevronDown"
+                                                        aria-label="Move down"
+                                                        disabled={idx === ((elements.find(e => e.id === selectedElementId).children || []).length - 1)}
+                                                        onClick={(e) => { e.stopPropagation(); moveStackItem(child.id, 1); }}
+                                                    />
+                                                    <Icon name="edit" size={12} />
+                                                </Box>
                                             </Box>
                                             <Text size="xsmall" textColor="light" truncate>
                                                 {child.fieldId ? 'Linked Field' : child.text || 'Element'}
@@ -2336,6 +2555,15 @@ function UpgradedPageDesigner() {
                                             </Box>
                                             <Box marginTop={2} padding={2} border="default" borderRadius="default" backgroundColor="white">
                                                 <Box display="flex" alignItems="center">
+                                                    <Switch value={activeElement.transparentPng || false} onChange={val => reencodeStaticImage(activeElement, val)} marginRight={2} />
+                                                    <Text>Transparent (PNG)</Text>
+                                                </Box>
+                                                <Text size="xsmall" textColor="light" marginTop={1}>
+                                                    Keeps PNG alpha instead of flattening to JPEG. For a transparent image, turn this on and upload the PNG.
+                                                </Text>
+                                            </Box>
+                                            <Box marginTop={2} padding={2} border="default" borderRadius="default" backgroundColor="white">
+                                                <Box display="flex" alignItems="center">
                                                     <Switch value={activeElement.blurFill || false} onChange={val => updateSelected({ blurFill: val })} marginRight={2} />
                                                     <Text>Blur-fill background</Text>
                                                 </Box>
@@ -2437,6 +2665,69 @@ function UpgradedPageDesigner() {
                                                     Font size above acts as the maximum; long text shrinks to fit. Resize the box to control wrapping.
                                                 </Text>
                                             )}
+                                        </Box>
+                                    )}
+
+                                    {(activeElement.type === 'static' || (activeElement.type === 'field' && activeElement.displayMode === 'text')) && (
+                                        <Box marginTop={2} padding={2} border="default" borderRadius="default" backgroundColor="white">
+                                            <Box display="flex" justifyContent="space-between" alignItems="center" marginBottom={1}>
+                                                <Text size="small" style={{ fontWeight: 600 }}>Find &amp; Replace</Text>
+                                                <Button
+                                                    size="small"
+                                                    icon="plus"
+                                                    onClick={() => {
+                                                        const rules = Array.isArray(activeElement.replacements) ? activeElement.replacements : [];
+                                                        updateSelected({ replacements: [...rules, { find: '', replace: '' }] });
+                                                    }}
+                                                >
+                                                    Add rule
+                                                </Button>
+                                            </Box>
+                                            {(activeElement.replacements || []).map((rule, i) => (
+                                                <Box key={i} display="flex" alignItems="center" marginTop={1}>
+                                                    <Box flex="1">
+                                                        <Input
+                                                            size="small"
+                                                            width="100%"
+                                                            placeholder="Find"
+                                                            value={rule.find || ''}
+                                                            onChange={e => {
+                                                                const rules = [...(activeElement.replacements || [])];
+                                                                rules[i] = { ...rules[i], find: e.target.value };
+                                                                updateSelected({ replacements: rules });
+                                                            }}
+                                                        />
+                                                    </Box>
+                                                    <Text marginX={1} textColor="light">&rarr;</Text>
+                                                    <Box flex="1">
+                                                        <Input
+                                                            size="small"
+                                                            width="100%"
+                                                            placeholder={"Replace (\\n = line break)"}
+                                                            value={rule.replace || ''}
+                                                            onChange={e => {
+                                                                const rules = [...(activeElement.replacements || [])];
+                                                                rules[i] = { ...rules[i], replace: e.target.value };
+                                                                updateSelected({ replacements: rules });
+                                                            }}
+                                                        />
+                                                    </Box>
+                                                    <Button
+                                                        size="small"
+                                                        variant="danger"
+                                                        icon="trash"
+                                                        marginLeft={1}
+                                                        aria-label="Remove rule"
+                                                        onClick={() => {
+                                                            const rules = (activeElement.replacements || []).filter((_, j) => j !== i);
+                                                            updateSelected({ replacements: rules });
+                                                        }}
+                                                    />
+                                                </Box>
+                                            ))}
+                                            <Text size="xsmall" textColor="light" marginTop={1}>
+                                                {"Replaces text live for every record, top to bottom. Type \\n for a line break (also works in Find)."}
+                                            </Text>
                                         </Box>
                                     )}
 
