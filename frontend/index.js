@@ -369,6 +369,56 @@ function AutoFitText({ text, baseFontSize, boxW, boxH }) {
     );
 }
 
+// Downscale + re-encode a data URL so large uploads don't blow past globalConfig's
+// size limit. Falls back to the original on any failure.
+const downscaleImageDataUrl = (dataUrl, maxSize = 1600, quality = 0.85) => {
+    return new Promise((resolve) => {
+        try {
+            const img = new Image();
+            img.onload = () => {
+                try {
+                    let w = img.width, h = img.height;
+                    if (w > h) { if (w > maxSize) { h = Math.round(h * maxSize / w); w = maxSize; } }
+                    else { if (h > maxSize) { w = Math.round(w * maxSize / h); h = maxSize; } }
+                    const c = document.createElement('canvas');
+                    c.width = w; c.height = h;
+                    c.getContext('2d').drawImage(img, 0, 0, w, h);
+                    resolve(c.toDataURL('image/jpeg', quality));
+                } catch (e) { resolve(dataUrl); }
+            };
+            img.onerror = () => resolve(dataUrl);
+            img.src = dataUrl;
+        } catch (e) { resolve(dataUrl); }
+    });
+};
+
+// Catches render-time errors so one bad element/field can't white-screen the whole
+// extension (as the earlier `process`-undefined crash did). Shows the error + recovery.
+class ErrorBoundary extends React.Component {
+    constructor(props) { super(props); this.state = { error: null }; }
+    static getDerivedStateFromError(error) { return { error }; }
+    componentDidCatch(error, info) { console.error("Roster Builder render error:", error, info); }
+    render() {
+        if (this.state.error) {
+            const msg = (this.state.error && this.state.error.message) ? this.state.error.message : String(this.state.error);
+            return (
+                <div style={{ padding: '24px', fontFamily: 'Helvetica, Arial, sans-serif', maxWidth: '640px' }}>
+                    <h2 style={{ margin: '0 0 8px' }}>Something went wrong</h2>
+                    <p style={{ color: '#555', marginTop: 0 }}>
+                        The extension hit an error and stopped rendering. "Try again" re-renders; if it keeps happening, reload.
+                    </p>
+                    <pre style={{ whiteSpace: 'pre-wrap', background: '#fbeaea', color: '#a32d2d', padding: '12px', borderRadius: '6px', fontSize: '12px' }}>{msg}</pre>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                        <button onClick={() => this.setState({ error: null })} style={{ padding: '8px 14px', cursor: 'pointer' }}>Try again</button>
+                        <button onClick={() => window.location.reload()} style={{ padding: '8px 14px', cursor: 'pointer' }}>Reload</button>
+                    </div>
+                </div>
+            );
+        }
+        return this.props.children;
+    }
+}
+
 function UpgradedPageDesigner() {
     // 2. STATE MANAGEMENT
     const base = useBase();
@@ -710,8 +760,10 @@ function UpgradedPageDesigner() {
         const file = e.target.files[0];
         if (file) {
             const reader = new FileReader();
-            reader.onload = (f) => {
-                updatePageStyle({ type: 'image', imageUrl: f.target.result });
+            reader.onload = async (f) => {
+                // Downscale so a full-res photo doesn't overflow globalConfig.
+                const scaled = await downscaleImageDataUrl(f.target.result, 1600, 0.85);
+                updatePageStyle({ type: 'image', imageUrl: scaled });
             };
             reader.readAsDataURL(file);
         }
@@ -981,6 +1033,82 @@ function UpgradedPageDesigner() {
         });
         updateElements(elements.map(e => map[e.id] ? { ...e, ...map[e.id] } : e));
     };
+
+    // ── SELECTION ACTIONS (used by buttons + keyboard shortcuts) ────────────
+    const genId = () => Date.now().toString() + Math.random().toString(36).substr(2, 5);
+
+    const deleteSelected = () => {
+        if (selectedStackChildId) { removeStackItem(selectedStackChildId); return; }
+        if (selectedIds.length === 0) return;
+        const ids = new Set(selectedIds);
+        updateElements(elements.filter(e => !ids.has(e.id)));
+        setSelectedElementId(null);
+        setSelectedIds([]);
+    };
+
+    const duplicateSelected = () => {
+        if (selectedStackChildId || selectedIds.length === 0) return; // top-level only
+        const ids = new Set(selectedIds);
+        const copies = [];
+        elements.forEach(e => {
+            if (!ids.has(e.id)) return;
+            const copy = JSON.parse(JSON.stringify(e));
+            copy.id = genId();
+            if (Array.isArray(copy.children)) copy.children = copy.children.map(c => ({ ...c, id: genId() }));
+            copy.x = (e.x || 0) + 12;
+            copy.y = (e.y || 0) + 12;
+            copies.push(copy);
+        });
+        if (copies.length === 0) return;
+        updateElements([...elements, ...copies]);
+        const newIds = copies.map(c => c.id);
+        setSelectedIds(newIds);
+        setSelectedElementId(newIds[newIds.length - 1]);
+    };
+
+    const nudgeSelected = (dx, dy) => {
+        if (selectedIds.length === 0) return;
+        const ids = new Set(selectedIds);
+        updateElements(elements.map(e => ids.has(e.id) ? { ...e, x: (e.x || 0) + dx, y: (e.y || 0) + dy } : e));
+    };
+
+    const deselectAll = () => {
+        setSelectedElementId(null);
+        setSelectedStackChildId(null);
+        setSelectedIds([]);
+    };
+
+    // Keyboard shortcuts (kept fresh via a ref so the once-attached listener never
+    // closes over stale selection/elements). Ignored while typing in a field.
+    const shortcutsRef = useRef(null);
+    shortcutsRef.current = (e) => {
+        const t = e.target;
+        const tag = t && t.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+        const hasSel = selectedIds.length > 0 || !!selectedStackChildId;
+        const key = e.key || '';
+        if (key === 'Delete' || key === 'Backspace') {
+            if (hasSel) { e.preventDefault(); deleteSelected(); }
+        } else if ((e.metaKey || e.ctrlKey) && key.toLowerCase() === 'd') {
+            e.preventDefault(); duplicateSelected();
+        } else if (key === 'Escape') {
+            deselectAll();
+        } else if (key.indexOf('Arrow') === 0) {
+            if (!hasSel || selectedStackChildId) return; // stack children are flex-positioned
+            const step = e.shiftKey ? 10 : 1;
+            let dx = 0, dy = 0;
+            if (key === 'ArrowLeft') dx = -step;
+            else if (key === 'ArrowRight') dx = step;
+            else if (key === 'ArrowUp') dy = -step;
+            else if (key === 'ArrowDown') dy = step;
+            if (dx || dy) { e.preventDefault(); nudgeSelected(dx, dy); }
+        }
+    };
+    useEffect(() => {
+        const onKey = (e) => { if (shortcutsRef.current) shortcutsRef.current(e); };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, []);
 
     const updateSelected = (updates) => {
         if (selectedStackChildId) {
@@ -1970,7 +2098,11 @@ function UpgradedPageDesigner() {
                         <>
                             <Box display="flex" justifyContent="space-between" alignItems="center" marginBottom={2}>
                                 <Heading size="xsmall">{selectedIds.length} elements selected</Heading>
-                                <Button size="small" variant="default" onClick={() => { setSelectedIds([]); setSelectedElementId(null); }}>Clear</Button>
+                                <Box display="flex" gap={1}>
+                                    <Button size="small" variant="default" icon="duplicate" onClick={duplicateSelected} aria-label="Duplicate" />
+                                    <Button size="small" variant="danger" icon="trash" onClick={deleteSelected} aria-label="Delete" />
+                                    <Button size="small" variant="default" onClick={() => { setSelectedIds([]); setSelectedElementId(null); }}>Clear</Button>
+                                </Box>
                             </Box>
                             <Text size="small" textColor="light" marginBottom={2}>
                                 Align and distribute relative to each other. Shift/Cmd-click elements to add or remove from the selection; drag any one to move them together.
@@ -2000,13 +2132,18 @@ function UpgradedPageDesigner() {
                         <>
                             <Box display="flex" justifyContent="space-between" alignItems="center" marginBottom={3}>
                                 <Heading size="xsmall">Edit {selectedStackChildId ? 'Stack Item' : 'Element'}</Heading>
-                                <Button size="small" variant="danger" onClick={() => {
-                                    if(selectedStackChildId) {
-                                        removeStackItem(selectedStackChildId);
-                                    } else {
-                                        deleteElement(selectedElementId);
-                                    }
-                                }}>Delete</Button>
+                                <Box display="flex" gap={1}>
+                                    {!selectedStackChildId && (
+                                        <Button size="small" variant="default" icon="duplicate" onClick={duplicateSelected}>Duplicate</Button>
+                                    )}
+                                    <Button size="small" variant="danger" onClick={() => {
+                                        if(selectedStackChildId) {
+                                            removeStackItem(selectedStackChildId);
+                                        } else {
+                                            deleteElement(selectedElementId);
+                                        }
+                                    }}>Delete</Button>
+                                </Box>
                             </Box>
                             
                             {selectedStackChildId && (
@@ -2830,4 +2967,8 @@ function UpgradedPageDesigner() {
     );
 }
 
-initializeBlock(() => <UpgradedPageDesigner />);
+initializeBlock(() => (
+    <ErrorBoundary>
+        <UpgradedPageDesigner />
+    </ErrorBoundary>
+));
