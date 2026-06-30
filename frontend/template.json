@@ -7,13 +7,13 @@
       "iconType": "link",
       "fieldId": "fldhq32QoI0KlPVRE",
       "text": "",
-      "x": 0,
+      "x": 9.899999999999977,
       "y": 0,
       "width": 705,
       "height": 84,
       "style": {
         "fontSize": "60px",
-        "fontFamily": "\"Sora\", sans-serif",
+        "fontFamily": "\"Roboto\", sans-serif",
         "color": "#ffffff",
         "backgroundColor": "transparent",
         "fontWeight": "bold",
@@ -28,36 +28,13 @@
       "autoFitText": true
     },
     {
-      "id": "1770349772366",
-      "type": "shape",
-      "shapeType": "line",
-      "x": 0,
-      "y": 160.5,
-      "width": 716.9,
-      "height": 2.1,
-      "style": {
-        "fontSize": "12px",
-        "fontFamily": "\"Sora\", sans-serif",
-        "fontWeight": "normal",
-        "color": "#000000",
-        "backgroundColor": "#ffffff",
-        "borderColor": "#ffffff",
-        "borderWidth": "0px",
-        "textAlign": "left",
-        "padding": "5px",
-        "borderStyle": "solid",
-        "zIndex": 1
-      },
-      "fieldId": null
-    },
-    {
       "id": "1770350569551",
       "type": "field",
       "displayMode": "image",
       "iconType": "link",
       "fieldId": "fldMc9j12bgHFQtaI",
       "text": "",
-      "x": 713.9,
+      "x": 710.95,
       "y": 0,
       "width": 419,
       "height": 620,
@@ -75,7 +52,8 @@
         "zIndex": 1,
         "objectFit": "cover"
       },
-      "imageFit": "contain-blur"
+      "imageFit": "contain-blur",
+      "blurFill": true
     },
     {
       "id": "1770351381917",
@@ -84,13 +62,13 @@
       "iconType": "link",
       "fieldId": "fldnsS3iryuEN7evU",
       "text": "",
-      "x": 0,
-      "y": 171,
-      "width": 710,
-      "height": 253,
+      "x": 9.899999999999977,
+      "y": 175.0000000000001,
+      "width": 690,
+      "height": 254,
       "style": {
-        "fontSize": "24px",
-        "fontFamily": "\"Sora\", sans-serif",
+        "fontSize": "36px",
+        "fontFamily": "\"Outfit\", sans-serif",
         "fontWeight": "normal",
         "color": "#ffffff",
         "backgroundColor": "transparent",
@@ -111,8 +89,8 @@
       "iconType": "link",
       "fieldId": "fld8aHtjQ26P47Jkp",
       "text": "",
-      "x": 5,
-      "y": 78.5,
+      "x": 9.899999999999977,
+      "y": 79,
       "width": 380,
       "height": 32,
       "style": {
@@ -136,8 +114,8 @@
       "iconType": "link",
       "fieldId": "fldxbvebMmhTbAN8c",
       "text": "",
-      "x": 5,
-      "y": 124,
+      "x": 9.899999999999977,
+      "y": 124.5,
       "width": 518,
       "height": 31,
       "style": {
@@ -161,8 +139,8 @@
       "iconType": "link",
       "fieldId": "fldvjGj7MuOAadzEA",
       "text": "",
-      "x": 5,
-      "y": 102,
+      "x": 9.899999999999977,
+      "y": 101.5,
       "width": 559,
       "height": 32,
       "style": {
@@ -187,7 +165,7 @@
       "fieldId": null,
       "text": "",
       "x": 0,
-      "y": 551,
+      "y": 552,
       "width": 317,
       "height": 57,
       "stackDirection": "row",
@@ -399,7 +377,7 @@
       "iconType": "link",
       "fieldId": null,
       "text": "",
-      "x": 217,
+      "x": 231,
       "y": 429.0000000000001,
       "width": 200,
       "height": 162,
@@ -495,7 +473,7 @@
       "iconType": "link",
       "fieldId": null,
       "text": "",
-      "x": 13,
+      "x": 0,
       "y": 429.0000000000001,
       "width": 216,
       "height": 157,
@@ -583,6 +561,28 @@
         "borderStyle": "dashed",
         "zIndex": 1
       }
+    },
+    {
+      "id": "178277614536293f56",
+      "type": "shape",
+      "shapeType": "line",
+      "x": 14.899999999999977,
+      "y": 165,
+      "width": 679,
+      "height": 4,
+      "style": {
+        "fontSize": "14px",
+        "fontFamily": "Helvetica, Arial, sans-serif",
+        "fontWeight": "normal",
+        "color": "#000000",
+        "backgroundColor": "#ffffff",
+        "borderColor": "#000000",
+        "borderWidth": "0px",
+        "textAlign": "left",
+        "padding": "0px",
+        "borderStyle": "solid",
+        "zIndex": 1
+      }
     }
   ],
   "pageStyle": {
@@ -593,12 +593,5 @@
     "width": 1130,
     "height": 620,
     "fontFamily": "\"Sora\", sans-serif"
-  },
-  "rosterFilter": {
-    "fieldId": "fldOel0YU3tr7PBoZ",
-    "values": [
-      "Shortlist",
-      "Ready"
-    ]
   }
 }

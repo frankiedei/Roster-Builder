@@ -255,6 +255,36 @@ const fetchImageAsBase64 = (url) => {
     });
 };
 
+// Bake a blurred raster from a (same-origin) base64 image. CSS filter:blur() is
+// ignored by html2canvas, so the blurred backdrop must be a real image to survive
+// PDF export. Small + JPEG since it's only ever shown blurred. Returns null on
+// failure (caller falls back to the unblurred photo).
+const generateBlurredDataUrl = (base64, { width = 240, blur = 14 } = {}) => {
+    return new Promise((resolve) => {
+        if (!base64) { resolve(null); return; }
+        try {
+            const img = new Image();
+            img.onload = () => {
+                try {
+                    const ar = (img.width && img.height) ? (img.width / img.height) : 1;
+                    const w = width;
+                    const h = Math.max(1, Math.round(width / (ar || 1)));
+                    const canvas = document.createElement('canvas');
+                    canvas.width = w;
+                    canvas.height = h;
+                    const ctx = canvas.getContext('2d');
+                    const o = Math.ceil(blur * 2); // overscan so the blurred edges stay covered
+                    if ('filter' in ctx) ctx.filter = `blur(${blur}px)`;
+                    ctx.drawImage(img, -o, -o, w + 2 * o, h + 2 * o);
+                    resolve(canvas.toDataURL('image/jpeg', 0.6));
+                } catch (e) { resolve(null); }
+            };
+            img.onerror = () => resolve(null);
+            img.src = base64;
+        } catch (e) { resolve(null); }
+    });
+};
+
 // --- AUTO-FIT TEXT ---
 // Renders text that shrinks its font size (never grows past the configured size)
 // until it fits inside its box on BOTH axes. Used for bios and any field whose
@@ -267,33 +297,60 @@ function AutoFitText({ text, baseFontSize, boxW, boxH }) {
     const ref = useRef(null);
     const startSize = parseFloat(baseFontSize) || 14;
     const [fontSize, setFontSize] = useState(startSize);
+    const rafRef = useRef(0);
+    const lastSizeRef = useRef('');
 
     useLayoutEffect(() => {
         const node = ref.current;
         if (!node) return;
 
-        const fits = () => node.scrollHeight <= node.clientHeight + 0.5
-            && node.scrollWidth <= node.clientWidth + 0.5;
+        // Apply the chosen size BOTH imperatively (so the current frame paints the
+        // final size — no flash to full size) and via state (so React stays in sync).
+        const apply = (px) => {
+            node.style.fontSize = px + 'px';
+            setFontSize(px);
+        };
 
-        // If it already fits at the configured size, keep that size.
-        node.style.fontSize = startSize + 'px';
-        if (fits()) {
-            node.style.fontSize = '';
-            setFontSize(startSize);
-            return;
-        }
+        const fit = () => {
+            if (node.clientHeight <= 0 || node.clientWidth <= 0) return; // not laid out yet
+            const fits = () => node.scrollHeight <= node.clientHeight + 0.5
+                && node.scrollWidth <= node.clientWidth + 0.5;
 
-        // Binary search the largest size (down to AUTOFIT_MIN_PX) that fits.
-        let lo = AUTOFIT_MIN_PX;
-        let hi = startSize;
-        let best = AUTOFIT_MIN_PX;
-        for (let i = 0; i < 18 && hi - lo > 0.25; i++) {
-            const mid = (lo + hi) / 2;
-            node.style.fontSize = mid + 'px';
-            if (fits()) { best = mid; lo = mid; } else { hi = mid; }
+            node.style.fontSize = startSize + 'px';
+            if (fits()) { apply(startSize); return; }
+
+            let lo = AUTOFIT_MIN_PX, hi = startSize, best = AUTOFIT_MIN_PX;
+            for (let i = 0; i < 16 && hi - lo > 0.25; i++) {
+                const mid = (lo + hi) / 2;
+                node.style.fontSize = mid + 'px';
+                if (fits()) { best = mid; lo = mid; } else { hi = mid; }
+            }
+            apply(best);
+        };
+
+        // Coalesce re-fits to once per frame, and ignore notifications where the box
+        // size didn't actually change (font changes don't resize the node, so this
+        // also prevents any observer feedback).
+        const scheduleFit = () => {
+            const key = node.clientWidth + 'x' + node.clientHeight;
+            if (key === lastSizeRef.current) return;
+            lastSizeRef.current = key;
+            if (rafRef.current) cancelAnimationFrame(rafRef.current);
+            rafRef.current = requestAnimationFrame(fit);
+        };
+
+        lastSizeRef.current = node.clientWidth + 'x' + node.clientHeight;
+        fit();
+
+        let ro = null;
+        if (typeof ResizeObserver !== 'undefined') {
+            ro = new ResizeObserver(scheduleFit);
+            ro.observe(node);
         }
-        node.style.fontSize = '';
-        setFontSize(best);
+        return () => {
+            if (ro) ro.disconnect();
+            if (rafRef.current) cancelAnimationFrame(rafRef.current);
+        };
     }, [text, startSize, boxW, boxH]);
 
     return (
@@ -344,12 +401,14 @@ function UpgradedPageDesigner() {
     
     const [selectedElementId, setSelectedElementId] = useState(null);
     const [selectedStackChildId, setSelectedStackChildId] = useState(null); // New: Track selected item inside stack
+    const [selectedIds, setSelectedIds] = useState([]); // multi-select: ids highlighted/organized together
     const [editMode, setEditMode] = useState('elements'); 
     
     const [recordIndex, setRecordIndex] = useState(0);
     const [isExporting, setIsExporting] = useState(false);
     const [sessionImage, setSessionImage] = useState(null);
     const [imageCache, setImageCache] = useState({}); 
+    const [blurCache, setBlurCache] = useState({}); // url -> baked blurred data URL (for blur-fill)
 
     // --- FILTER & SEARCH STATE ---
     const [searchName, setSearchName] = useState('');
@@ -382,6 +441,8 @@ function UpgradedPageDesigner() {
     // --- RESIZING & DRAGGING STATE ENGINE ---
     const [resizingState, setResizingState] = useState(null); 
     const [draggingState, setDraggingState] = useState(null); 
+    const [groupDrag, setGroupDrag] = useState(null); // {id: {x,y}} live positions during a multi-select move
+    const groupStartRef = useRef(null);
     const [guides, setGuides] = useState([]); 
 
     // Data Fetching
@@ -551,6 +612,7 @@ function UpgradedPageDesigner() {
     const pageRef = useRef(null);
     const fileInputRef = useRef(null);
     const iconInputRef = useRef(null); 
+    const staticImageInputRef = useRef(null);
     // FIX (crash on click): react-draggable v4 without a nodeRef falls back to the
     // deprecated ReactDOM.findDOMNode. In the released-block iframe that lookup can
     // resolve to null, and react-draggable then reads `.parentNode`/offsets off null
@@ -564,9 +626,58 @@ function UpgradedPageDesigner() {
     };
 
     // 3. ACTIONS
+    const historyRef = useRef({ past: [], future: [] });
+    const [historyTick, setHistoryTick] = useState(0);
+
     const updateElements = (newElements) => {
+        // Record the pre-change snapshot for undo. Elements only (page background,
+        // fonts, and the roster filter are tracked separately and aren't part of
+        // this history). Bounded so it can't grow without limit.
+        const h = historyRef.current;
+        h.past.push(JSON.stringify(elements));
+        if (h.past.length > 60) h.past.shift();
+        h.future = [];
+        setHistoryTick(t => t + 1);
         globalConfig.setAsync('elements', newElements);
     };
+
+    const undo = () => {
+        const h = historyRef.current;
+        if (h.past.length === 0) return;
+        const prev = h.past.pop();
+        h.future.push(JSON.stringify(elements));
+        setHistoryTick(t => t + 1);
+        globalConfig.setAsync('elements', JSON.parse(prev));
+        setSelectedElementId(null); setSelectedStackChildId(null); setSelectedIds([]);
+    };
+
+    const redo = () => {
+        const h = historyRef.current;
+        if (h.future.length === 0) return;
+        const next = h.future.pop();
+        h.past.push(JSON.stringify(elements));
+        setHistoryTick(t => t + 1);
+        globalConfig.setAsync('elements', JSON.parse(next));
+        setSelectedElementId(null); setSelectedStackChildId(null); setSelectedIds([]);
+    };
+
+    // Keep refs to the latest undo/redo so a once-attached key listener never goes stale.
+    const undoRef = useRef(undo); undoRef.current = undo;
+    const redoRef = useRef(redo); redoRef.current = redo;
+    useEffect(() => {
+        const onKey = (e) => {
+            const t = e.target;
+            const tag = t && t.tagName;
+            const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable);
+            if (typing) return;
+            if (!(e.metaKey || e.ctrlKey)) return;
+            const k = (e.key || '').toLowerCase();
+            if (k === 'z' && !e.shiftKey) { e.preventDefault(); undoRef.current(); }
+            else if ((k === 'z' && e.shiftKey) || k === 'y') { e.preventDefault(); redoRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, []);
 
     const updatePageStyle = async (updates) => {
         const newStyle = { ...pageStyle, ...updates };
@@ -680,6 +791,7 @@ function UpgradedPageDesigner() {
         const newElement = createLayer(type, fieldId);
         updateElements([...elements, newElement]);
         setSelectedElementId(newElement.id);
+        setSelectedIds([newElement.id]);
         setEditMode('elements');
     };
 
@@ -760,14 +872,15 @@ function UpgradedPageDesigner() {
     const addShape = (shapeType) => {
         const isLine = shapeType === 'line';
         const newElement = {
-            id: Date.now().toString(),
+            id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
             type: 'shape', 
             shapeType: shapeType, 
             x: 50, y: 50,
             width: isLine ? 200 : 100,
-            height: isLine ? 0.5 : 100,
+            height: isLine ? 1 : 100,        // line height == thickness (1px default)
             style: { 
                 ...DEFAULT_ELEMENT_STYLE,
+                padding: '0px',              // lines/shapes shouldn't carry text padding
                 backgroundColor: isLine ? '#000000' : '#cccccc',
                 borderWidth: '0px',
                 borderColor: '#000000'
@@ -775,7 +888,98 @@ function UpgradedPageDesigner() {
         };
         updateElements([...elements, newElement]);
         setSelectedElementId(newElement.id);
+        setSelectedIds([newElement.id]);
         setEditMode('elements');
+    };
+
+    // Static (uploaded) image element — not tied to a record field.
+    const addStaticImage = () => {
+        const newElement = {
+            id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+            type: 'static',
+            displayMode: 'image',
+            staticImage: null,
+            x: 50, y: 50, width: 220, height: 160,
+            style: { ...DEFAULT_ELEMENT_STYLE, padding: '0px', backgroundColor: 'transparent', borderWidth: '0px', borderColor: 'transparent' }
+        };
+        updateElements([...elements, newElement]);
+        setSelectedElementId(newElement.id);
+        setSelectedIds([newElement.id]);
+        setEditMode('elements');
+        // Open the file picker right away.
+        setTimeout(() => { if (staticImageInputRef.current) staticImageInputRef.current.click(); }, 60);
+    };
+
+    // Downscale + store an uploaded image on the selected element (keeps globalConfig
+    // size sane — full-res data URLs can be multiple MB).
+    const handleStaticImageUpload = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (f) => {
+            const img = new Image();
+            img.onload = () => {
+                const MAX = 1200;
+                let w = img.width, h = img.height;
+                if (w > h) { if (w > MAX) { h = Math.round(h * MAX / w); w = MAX; } }
+                else { if (h > MAX) { w = Math.round(w * MAX / h); h = MAX; } }
+                const c = document.createElement('canvas');
+                c.width = w; c.height = h;
+                c.getContext('2d').drawImage(img, 0, 0, w, h);
+                updateSelected({ staticImage: c.toDataURL('image/jpeg', 0.85) });
+            };
+            img.onerror = () => updateSelected({ staticImage: f.target.result });
+            img.src = f.target.result;
+        };
+        reader.readAsDataURL(file);
+        e.target.value = ''; // allow re-uploading the same file
+    };
+
+    // ── MULTI-SELECT ORGANIZE ──────────────────────────────────────────────
+    const getSelectedElements = () => elements.filter(e => selectedIds.includes(e.id));
+
+    // Align the selected elements to one another (relative to the group's bounds),
+    // not to the page.
+    const alignSelected = (mode) => {
+        const sel = getSelectedElements();
+        if (sel.length < 2) return;
+        const minL = Math.min(...sel.map(e => e.x));
+        const maxR = Math.max(...sel.map(e => e.x + (e.width || 0)));
+        const minT = Math.min(...sel.map(e => e.y));
+        const maxB = Math.max(...sel.map(e => e.y + (e.height || 0)));
+        const cx = (minL + maxR) / 2, cy = (minT + maxB) / 2;
+        const map = {};
+        sel.forEach(e => {
+            const w = e.width || 0, h = e.height || 0;
+            let nx = e.x, ny = e.y;
+            if (mode === 'left') nx = minL;
+            else if (mode === 'right') nx = maxR - w;
+            else if (mode === 'hcenter') nx = cx - w / 2;
+            else if (mode === 'top') ny = minT;
+            else if (mode === 'bottom') ny = maxB - h;
+            else if (mode === 'vcenter') ny = cy - h / 2;
+            map[e.id] = { x: nx, y: ny };
+        });
+        updateElements(elements.map(e => map[e.id] ? { ...e, ...map[e.id] } : e));
+    };
+
+    // Even spacing between centers, along an axis (needs 3+).
+    const distributeSelected = (axis) => {
+        const sel = getSelectedElements();
+        if (sel.length < 3) return;
+        const sorted = [...sel].sort((a, b) => axis === 'h' ? a.x - b.x : a.y - b.y);
+        const centerOf = (e) => axis === 'h' ? e.x + (e.width || 0) / 2 : e.y + (e.height || 0) / 2;
+        const startC = centerOf(sorted[0]);
+        const endC = centerOf(sorted[sorted.length - 1]);
+        const step = (endC - startC) / (sorted.length - 1);
+        const map = {};
+        sorted.forEach((e, i) => {
+            const c = startC + step * i;
+            map[e.id] = axis === 'h'
+                ? { x: c - (e.width || 0) / 2, y: e.y }
+                : { x: e.x, y: c - (e.height || 0) / 2 };
+        });
+        updateElements(elements.map(e => map[e.id] ? { ...e, ...map[e.id] } : e));
     };
 
     const updateSelected = (updates) => {
@@ -820,6 +1024,7 @@ function UpgradedPageDesigner() {
         const newElements = elements.filter(el => el.id !== id);
         updateElements(newElements);
         setSelectedElementId(null);
+        setSelectedIds([]);
     };
     
     const resetCanvas = () => {
@@ -973,13 +1178,50 @@ function UpgradedPageDesigner() {
         return { x: newX, y: newY, activeGuides };
     };
 
+    // On drag start, if the grabbed element is part of a multi-selection, snapshot
+    // every selected element's start position so the whole group moves together.
+    const handleDragStart = (e, data, id) => {
+        if (selectedIds.length > 1 && selectedIds.includes(id)) {
+            const positions = {};
+            elements.forEach(el => { if (selectedIds.includes(el.id)) positions[el.id] = { x: el.x, y: el.y }; });
+            groupStartRef.current = { anchorId: id, anchor: { x: data.x, y: data.y }, positions };
+        } else {
+            groupStartRef.current = null;
+        }
+    };
+
     const handleDrag = (e, data, id) => {
+        const g = groupStartRef.current;
+        if (g && g.anchorId === id) {
+            const dx = data.x - g.anchor.x;
+            const dy = data.y - g.anchor.y;
+            const moved = {};
+            Object.keys(g.positions).forEach(eid => {
+                moved[eid] = { x: g.positions[eid].x + dx, y: g.positions[eid].y + dy };
+            });
+            setGroupDrag(moved);
+            setGuides([]); // snapping is per-element; skip it during a group move
+            return;
+        }
         const { x, y, activeGuides } = calculateSnap(id, data.x, data.y);
         setDraggingState({ id, x, y });
         setGuides(activeGuides);
     };
 
     const handleDragStop = (e, data, id) => {
+        const g = groupStartRef.current;
+        if (g && g.anchorId === id) {
+            const dx = data.x - g.anchor.x;
+            const dy = data.y - g.anchor.y;
+            const newElements = elements.map(el => (
+                g.positions[el.id] ? { ...el, x: g.positions[el.id].x + dx, y: g.positions[el.id].y + dy } : el
+            ));
+            updateElements(newElements);
+            groupStartRef.current = null;
+            setGroupDrag(null);
+            setGuides([]);
+            return;
+        }
         const { x, y } = calculateSnap(id, data.x, data.y);
         updateElementPosition(id, x, y);
         setDraggingState(null);
@@ -1042,8 +1284,53 @@ function UpgradedPageDesigner() {
     // elements and imageCache without needing to be recreated on every render.
     const elementsRef = useRef(elements);
     const imageCacheRef = useRef(imageCache);
+    const blurCacheRef = useRef(blurCache);
     useEffect(() => { elementsRef.current = elements; }, [elements]);
     useEffect(() => { imageCacheRef.current = imageCache; }, [imageCache]);
+    useEffect(() => { blurCacheRef.current = blurCache; }, [blurCache]);
+
+    // Blur-fill targets for a record: { key, base64 } pairs. Field images key by
+    // attachment URL (base64 only once cached); static images key by element id and
+    // carry their own data URL.
+    const blurTargetsForRecord = (record, cacheOverride) => {
+        const cache = cacheOverride || imageCacheRef.current;
+        const targets = [];
+        const collect = (el) => {
+            if (el.displayMode === 'image' && el.blurFill) {
+                if (el.type === 'field' && record && el.fieldId) {
+                    const raw = safeGetCellValue(record, table, el.fieldId);
+                    const u = (Array.isArray(raw) && raw[0] && raw[0].url) ? raw[0].url : null;
+                    if (u && cache[u]) targets.push({ key: u, base64: cache[u] });
+                } else if (el.staticImage) {
+                    targets.push({ key: 'static:' + el.id, base64: el.staticImage });
+                }
+            }
+            if (el.type === 'stack' && el.children) el.children.forEach(collect);
+        };
+        (elementsRef.current || []).forEach(collect);
+        return targets;
+    };
+
+    // Generate any missing blurred variants for the given targets. Commits once.
+    const ensureBlurForTargets = async (targets) => {
+        const blurs = blurCacheRef.current;
+        const seen = new Set();
+        const todo = [];
+        for (const t of targets) {
+            if (!t || !t.key || !t.base64 || blurs[t.key] || seen.has(t.key)) continue;
+            seen.add(t.key);
+            todo.push(t);
+        }
+        if (todo.length === 0) return;
+        const updates = {};
+        for (const t of todo) {
+            const b = await generateBlurredDataUrl(t.base64);
+            if (b) updates[t.key] = b;
+        }
+        if (Object.keys(updates).length > 0) {
+            setBlurCache(prev => ({ ...prev, ...updates }));
+        }
+    };
 
     const prepareRecordForPrint = async (record) => {
         const cacheUpdates = {};
@@ -1088,6 +1375,16 @@ function UpgradedPageDesigner() {
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [currentRecord?.id]); // Depend on ID only — stable reference
+
+    // Generate the blurred backdrop(s) for the current record's blur-fill images,
+    // once their base64 is cached. Re-runs when the record, the cache, or the
+    // layout (e.g. toggling blur-fill on) changes.
+    useEffect(() => {
+        if (currentRecord) {
+            ensureBlurForTargets(blurTargetsForRecord(currentRecord));
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [currentRecord?.id, imageCache, elements]);
 
     // 6. PDF GENERATION
     // Capture resolution multiplier. Higher = crisper output (text, raster images,
@@ -1173,6 +1470,12 @@ function UpgradedPageDesigner() {
         if (Object.keys(cacheUpdates).length > 0) {
             setImageCache(prev => ({ ...prev, ...cacheUpdates }));
         }
+
+        // Pre-bake blurred backdrops for any blur-fill images, using the merged cache
+        // so it doesn't depend on the setImageCache above having flushed yet.
+        const mergedCache = { ...currentCache, ...cacheUpdates };
+        const blurTargets = recordsToPrint.flatMap(r => blurTargetsForRecord(r, mergedCache));
+        await ensureBlurForTargets(blurTargets);
     };
 
     // Capture the live page container to a cropped PNG data URL.
@@ -1336,21 +1639,56 @@ function UpgradedPageDesigner() {
         } 
         // 3. IMAGES (Attachments)
         else if (el.displayMode === 'image') {
-            let imgSrc = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='150' height='150'%3E%3Crect width='150' height='150' fill='%23e0e0e0'/%3E%3Ctext x='50%25' y='50%25' dominant-baseline='middle' text-anchor='middle' fill='%23999' font-size='12' font-family='sans-serif'%3ENo Image%3C/text%3E%3C/svg%3E";
+            const placeholder = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='150' height='150'%3E%3Crect width='150' height='150' fill='%23e0e0e0'/%3E%3Ctext x='50%25' y='50%25' dominant-baseline='middle' text-anchor='middle' fill='%23999' font-size='12' font-family='sans-serif'%3ENo Image%3C/text%3E%3C/svg%3E";
+            let imgSrc = placeholder;
+            let url = null;
+            let blurKey = null;
             if (el.type === 'field' && currentRecord && el.fieldId) {
-                // FIX: Use safe wrapper
                 const val = safeGetCellValue(currentRecord, table, el.fieldId);
                 if (Array.isArray(val) && val[0] && val[0].url) {
-                    imgSrc = imageCache[val[0].url] || val[0].url;
+                    url = val[0].url;
+                    imgSrc = imageCache[url] || url;
+                    blurKey = url;
                 }
+            } else if (el.staticImage) {
+                imgSrc = el.staticImage;
+                blurKey = 'static:' + el.id;
             }
+
+            const hasImage = imgSrc !== placeholder;
+
+            // Blur-fill: show the WHOLE photo (contain) over a blurred, zoomed copy of
+            // itself that fills the empty space. Falls back to the plain photo behind
+            // until the baked blur is ready (always ready before a bulk export).
+            if (el.blurFill && hasImage) {
+                const blurredSrc = (blurKey && blurCache[blurKey]) ? blurCache[blurKey] : imgSrc;
+                return (
+                    <div style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden', backgroundColor: '#000000' }}>
+                        <div style={{
+                            position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+                            backgroundImage: `url("${blurredSrc}")`,
+                            backgroundSize: 'cover',
+                            backgroundPosition: 'center',
+                            backgroundRepeat: 'no-repeat'
+                        }} />
+                        <div style={{
+                            position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+                            backgroundImage: `url("${imgSrc}")`,
+                            backgroundSize: 'contain',
+                            backgroundPosition: 'center',
+                            backgroundRepeat: 'no-repeat'
+                        }} />
+                    </div>
+                );
+            }
+
             return (
                 <div 
                     style={{
                         width: '100%', 
                         height: '100%', 
                         backgroundImage: `url("${imgSrc}")`,
-                        backgroundSize: 'cover',
+                        backgroundSize: el.imageFit === 'contain' ? 'contain' : 'cover',
                         backgroundPosition: 'center',
                         backgroundRepeat: 'no-repeat'
                     }} 
@@ -1400,6 +1738,16 @@ function UpgradedPageDesigner() {
     // 7. MAIN UI
     return (
         <Box display="flex" height="100vh" overflow="hidden">
+
+            {/* Always-mounted hidden input for static image uploads (the add panel
+                unmounts once an element is selected, so this can't live there). */}
+            <input
+                ref={staticImageInputRef}
+                type="file"
+                accept="image/*"
+                style={{ display: 'none' }}
+                onChange={handleStaticImageUpload}
+            />
             
             {/* --- SIDEBAR --- */}
             <Box width="320px" borderRight="thick" display="flex" flexDirection="column" backgroundColor="#f9f9f9">
@@ -1610,6 +1958,7 @@ function UpgradedPageDesigner() {
                                 <Button onClick={() => addElement('stack')}>+ Add Stack (Dynamic Row)</Button>
                                 <Button onClick={() => addShape('rectangle')}>+ Add Rectangle</Button>
                                 <Button onClick={() => addShape('line')}>+ Add Line</Button>
+                                <Button onClick={addStaticImage}>+ Add Image (Upload)</Button>
                             </Box>
 
                             <Heading size="xsmall" marginBottom={2}>Align Selected</Heading>
@@ -1617,7 +1966,37 @@ function UpgradedPageDesigner() {
                         </>
                     )}
 
-                    {editMode === 'elements' && selectedElementId && (
+                    {editMode === 'elements' && selectedIds.length >= 2 && (
+                        <>
+                            <Box display="flex" justifyContent="space-between" alignItems="center" marginBottom={2}>
+                                <Heading size="xsmall">{selectedIds.length} elements selected</Heading>
+                                <Button size="small" variant="default" onClick={() => { setSelectedIds([]); setSelectedElementId(null); }}>Clear</Button>
+                            </Box>
+                            <Text size="small" textColor="light" marginBottom={2}>
+                                Align and distribute relative to each other. Shift/Cmd-click elements to add or remove from the selection; drag any one to move them together.
+                            </Text>
+
+                            <Label>Align</Label>
+                            <Box display="flex" gap={1} marginBottom={2}>
+                                <Button size="small" onClick={() => alignSelected('left')}>Left</Button>
+                                <Button size="small" onClick={() => alignSelected('hcenter')}>Center</Button>
+                                <Button size="small" onClick={() => alignSelected('right')}>Right</Button>
+                            </Box>
+                            <Box display="flex" gap={1} marginBottom={3}>
+                                <Button size="small" onClick={() => alignSelected('top')}>Top</Button>
+                                <Button size="small" onClick={() => alignSelected('vcenter')}>Middle</Button>
+                                <Button size="small" onClick={() => alignSelected('bottom')}>Bottom</Button>
+                            </Box>
+
+                            <Label>Distribute {selectedIds.length < 3 ? '(needs 3+)' : ''}</Label>
+                            <Box display="flex" gap={1} marginBottom={2}>
+                                <Button size="small" disabled={selectedIds.length < 3} onClick={() => distributeSelected('h')}>Horizontally</Button>
+                                <Button size="small" disabled={selectedIds.length < 3} onClick={() => distributeSelected('v')}>Vertically</Button>
+                            </Box>
+                        </>
+                    )}
+
+                    {editMode === 'elements' && selectedElementId && selectedIds.length < 2 && (
                         <>
                             <Box display="flex" justifyContent="space-between" alignItems="center" marginBottom={3}>
                                 <Heading size="xsmall">Edit {selectedStackChildId ? 'Stack Item' : 'Element'}</Heading>
@@ -1751,6 +2130,22 @@ function UpgradedPageDesigner() {
                                                 onChange={val => updateSelected({displayMode: val})}
                                             />
                                             
+                                            {activeElement.displayMode === 'image' && (
+                                                <Box marginTop={2} padding={2} border="default" borderRadius="default" backgroundColor="white">
+                                                    <Box display="flex" alignItems="center">
+                                                        <Switch
+                                                            value={activeElement.blurFill || false}
+                                                            onChange={val => updateSelected({ blurFill: val })}
+                                                            marginRight={2}
+                                                        />
+                                                        <Text>Blur-fill background</Text>
+                                                    </Box>
+                                                    <Text size="xsmall" textColor="light" marginTop={1}>
+                                                        Shows the whole photo and fills the empty space with a blurred copy of it, instead of cropping to fill.
+                                                    </Text>
+                                                </Box>
+                                            )}
+
                                             {activeElement.displayMode === 'icon' && (
                                                 <Box marginTop={2}>
                                                     <Label>Icon Type</Label>
@@ -1782,13 +2177,66 @@ function UpgradedPageDesigner() {
                                         </Box>
                                     )}
 
-                                    {activeElement.type === 'static' && (
+                                    {activeElement.type === 'static' && activeElement.displayMode === 'image' && (
+                                        <Box marginBottom={2}>
+                                            <Label>Image</Label>
+                                            {activeElement.staticImage && (
+                                                <Box marginBottom={2} style={{ height: '90px', backgroundImage: `url("${activeElement.staticImage}")`, backgroundSize: 'contain', backgroundPosition: 'center', backgroundRepeat: 'no-repeat', border: '1px solid #ddd', borderRadius: '4px' }} />
+                                            )}
+                                            <Button size="small" icon="upload" onClick={() => staticImageInputRef.current && staticImageInputRef.current.click()}>
+                                                {activeElement.staticImage ? 'Replace image' : 'Upload image'}
+                                            </Button>
+                                            <Box marginTop={2}>
+                                                <Label>Fit</Label>
+                                                <Select
+                                                    options={[
+                                                        { value: 'cover', label: 'Fill box (crop)' },
+                                                        { value: 'contain', label: 'Fit whole image' },
+                                                    ]}
+                                                    value={activeElement.imageFit || 'cover'}
+                                                    onChange={val => updateSelected({ imageFit: val })}
+                                                />
+                                            </Box>
+                                            <Box marginTop={2} padding={2} border="default" borderRadius="default" backgroundColor="white">
+                                                <Box display="flex" alignItems="center">
+                                                    <Switch value={activeElement.blurFill || false} onChange={val => updateSelected({ blurFill: val })} marginRight={2} />
+                                                    <Text>Blur-fill background</Text>
+                                                </Box>
+                                            </Box>
+                                        </Box>
+                                    )}
+
+                                    {activeElement.type === 'static' && activeElement.displayMode !== 'image' && (
                                         <FormField label="Text Content">
                                             <Input 
                                                 value={activeElement.text}
                                                 onChange={e => updateSelected({text: e.target.value})}
                                             />
                                         </FormField>
+                                    )}
+
+                                    {activeElement.type === 'shape' && (
+                                        <Box marginBottom={2}>
+                                            <Label>{activeElement.shapeType === 'line' ? 'Line color' : 'Fill color'}</Label>
+                                            <Input
+                                                type="color"
+                                                value={activeElement.style.backgroundColor === 'transparent' ? '#000000' : activeElement.style.backgroundColor}
+                                                onChange={e => updateSelectedStyle('backgroundColor', e.target.value)}
+                                                style={{ cursor: 'pointer', height: '32px' }}
+                                            />
+                                            {activeElement.shapeType === 'line' && (
+                                                <Box marginTop={2}>
+                                                    <Label>Thickness (px)</Label>
+                                                    <Input
+                                                        type="number"
+                                                        step="0.5"
+                                                        min="0.5"
+                                                        value={activeElement.height}
+                                                        onChange={e => updateSelected({ height: Math.max(0.5, parseFloat(e.target.value) || 1) })}
+                                                    />
+                                                </Box>
+                                            )}
+                                        </Box>
                                     )}
 
                                     <Heading size="xsmall" marginTop={3} marginBottom={2}>Styling</Heading>
@@ -1917,6 +2365,17 @@ function UpgradedPageDesigner() {
                 {/* TOOLBAR */}
                 <Box padding={2} backgroundColor="white" borderBottom="thick" display="flex" flexWrap="wrap" alignItems="center" gap={2}>
                     <Heading size="small">Designer</Heading>
+
+                    <Box display="flex" gap={1}>
+                        <Tooltip content="Undo (Ctrl/Cmd+Z)">
+                            <Button size="small" variant="secondary" icon="undo" aria-label="Undo"
+                                onClick={undo} disabled={historyRef.current.past.length === 0} />
+                        </Tooltip>
+                        <Tooltip content="Redo (Ctrl/Cmd+Shift+Z)">
+                            <Button size="small" variant="secondary" icon="redo" aria-label="Redo"
+                                onClick={redo} disabled={historyRef.current.future.length === 0} />
+                        </Tooltip>
+                    </Box>
                     
                     <Box width="1px" height="20px" backgroundColor="lightGray2" marginX={2} />
                     
@@ -2058,7 +2517,7 @@ function UpgradedPageDesigner() {
                     <div 
                         ref={pageRef}
                         id="print-container"
-                        onClick={() => { setSelectedElementId(null); setSelectedStackChildId(null); }}
+                        onClick={() => { setSelectedElementId(null); setSelectedStackChildId(null); setSelectedIds([]); }}
                         style={{
                             ...getPageBackgroundStyle(),
                             width: pageStyle.width,
@@ -2089,12 +2548,15 @@ function UpgradedPageDesigner() {
                         ))}
 
                         {elements.map(el => {
-                            const isSelected = selectedElementId === el.id && !selectedStackChildId && !isExporting;
+                            const isSelected = selectedIds.includes(el.id) && !selectedStackChildId && !isExporting;
+                            const isPrimary = selectedElementId === el.id;
                             const isDragging = draggingState && draggingState.id === el.id;
-                            const visualX = isDragging ? draggingState.x : el.x;
-                            const visualY = isDragging ? draggingState.y : el.y;
+                            const gdPos = groupDrag && groupDrag[el.id];
+                            const visualX = gdPos ? gdPos.x : (isDragging ? draggingState.x : el.x);
+                            const visualY = gdPos ? gdPos.y : (isDragging ? draggingState.y : el.y);
                             const visualWidth = (resizingState && resizingState.id === el.id) ? resizingState.currentW : (el.width || 200);
                             const visualHeight = (resizingState && resizingState.id === el.id) ? resizingState.currentH : (el.height || 40);
+                            const showResize = isSelected && selectedIds.length === 1 && isPrimary;
 
                             // --- CONTENT RENDERING LOGIC ---
                             let content = null;
@@ -2158,7 +2620,7 @@ function UpgradedPageDesigner() {
                                     key={el.id}
                                     nodeRef={nodeRef}
                                     position={{x: visualX, y: visualY}}
-                                    onStart={(e, data) => handleDrag(e, data, el.id)}
+                                    onStart={(e, data) => handleDragStart(e, data, el.id)}
                                     onDrag={(e, data) => handleDrag(e, data, el.id)}
                                     onStop={(e, data) => handleDragStop(e, data, el.id)}
                                     bounds="parent"
@@ -2174,20 +2636,37 @@ function UpgradedPageDesigner() {
                                             height: visualHeight,
                                             position: 'absolute',
                                             cursor: 'move',
-                                            border: isSelected ? '1px dashed #2d7ff9' : el.style.borderWidth ? `${el.style.borderWidth} ${el.style.borderStyle} ${el.style.borderColor}` : '1px solid transparent',
+                                            // Real element border only (0px = none). Selection is shown with
+                                            // an OUTLINE, which sits outside the box and adds no size — so a
+                                            // 1px line stays 1px instead of being inflated by a 1px border.
+                                            border: (el.style.borderWidth && el.style.borderWidth !== '0px')
+                                                ? `${el.style.borderWidth} ${el.style.borderStyle} ${el.style.borderColor}` : 'none',
+                                            outline: isSelected ? (isPrimary ? '1px dashed #2d7ff9' : '1px dashed #9ec5fe') : 'none',
+                                            outlineOffset: '1px',
                                             boxSizing: 'border-box',
                                             transform: 'translateZ(0)',
                                         }}
                                         onClick={(e) => { 
                                             e.stopPropagation(); 
-                                            setSelectedElementId(el.id); 
                                             setSelectedStackChildId(null); 
                                             setEditMode('elements'); 
+                                            const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+                                            if (additive) {
+                                                setSelectedIds(prev => {
+                                                    const has = prev.includes(el.id);
+                                                    const next = has ? prev.filter(i => i !== el.id) : [...prev, el.id];
+                                                    setSelectedElementId(next.length ? (has ? next[next.length - 1] : el.id) : null);
+                                                    return next;
+                                                });
+                                            } else {
+                                                setSelectedElementId(el.id);
+                                                setSelectedIds([el.id]);
+                                            }
                                         }}
                                     >
                                         {content}
                                         
-                                        {isSelected && (
+                                        {showResize && (
                                             <div 
                                                 className="resize-handle"
                                                 style={{
