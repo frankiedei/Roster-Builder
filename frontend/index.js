@@ -424,6 +424,38 @@ const downscaleImageDataUrl = (dataUrl, maxSize = 1600, quality = 0.85) => {
     });
 };
 
+// Approximate the stored byte size of a data URL (base64 ~= 4/3 of the bytes).
+const dataUrlBytes = (dataUrl) => {
+    if (!dataUrl) return 0;
+    const i = dataUrl.indexOf(',');
+    const b64 = i >= 0 ? dataUrl.slice(i + 1) : dataUrl;
+    return Math.floor(b64.length * 3 / 4);
+};
+const formatBytes = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.round(n / 1024) + ' KB';
+
+// --- Nested-stack tree helpers. A stack's children may themselves be stacks, so
+// items are addressed by a PATH of child ids from the root element down. [] = root.
+const getChildByPath = (root, path) => {
+    let node = root;
+    for (let i = 0; i < (path || []).length; i++) {
+        if (!node || !Array.isArray(node.children)) return null;
+        node = node.children.find(c => c.id === path[i]);
+    }
+    return node || null;
+};
+const updateChildByPath = (root, path, updater) => {
+    if (!path || path.length === 0) return updater(root);
+    const [head, ...rest] = path;
+    return { ...root, children: (root.children || []).map(c => c.id === head ? updateChildByPath(c, rest, updater) : c) };
+};
+const removeChildByPath = (root, path) => {
+    if (!path || path.length === 0) return root;
+    const parentPath = path.slice(0, -1);
+    const targetId = path[path.length - 1];
+    return updateChildByPath(root, parentPath, (parent) => ({ ...parent, children: (parent.children || []).filter(c => c.id !== targetId) }));
+};
+const pathsEqual = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]);
+
 // Catches render-time errors so one bad element/field can't white-screen the whole
 // extension (as the earlier `process`-undefined crash did). Shows the error + recovery.
 class ErrorBoundary extends React.Component {
@@ -495,7 +527,8 @@ function UpgradedPageDesigner() {
     const [selectedTableId, setSelectedTableId] = useState(storedTableId || defaultTableId);
     
     const [selectedElementId, setSelectedElementId] = useState(null);
-    const [selectedStackChildId, setSelectedStackChildId] = useState(null); // New: Track selected item inside stack
+    const [selectedChildPath, setSelectedChildPath] = useState([]); // path of child ids into a stack; [] = the root element itself
+    const selectedStackChildId = selectedChildPath.length ? selectedChildPath[selectedChildPath.length - 1] : null; // derived: truthy iff a child is selected
     const [selectedIds, setSelectedIds] = useState([]); // multi-select: ids highlighted/organized together
     const [editMode, setEditMode] = useState('elements'); 
     
@@ -504,6 +537,9 @@ function UpgradedPageDesigner() {
     const [sessionImage, setSessionImage] = useState(null);
     const [imageCache, setImageCache] = useState({}); 
     const [blurCache, setBlurCache] = useState({}); // url -> baked blurred data URL (for blur-fill)
+    // When exporting one PDF per filter value, this temporarily scopes BOTH the roster
+    // and the title page's {filter} token to a single value. null = use the saved filter.
+    const [filterValueOverride, setFilterValueOverride] = useState(null);
 
     // --- FILTER & SEARCH STATE ---
     const [searchName, setSearchName] = useState('');
@@ -538,6 +574,7 @@ function UpgradedPageDesigner() {
     const [draggingState, setDraggingState] = useState(null); 
     const [groupDrag, setGroupDrag] = useState(null); // {id: {x,y}} live positions during a multi-select move
     const groupStartRef = useRef(null);
+    const [dropTargetStackId, setDropTargetStackId] = useState(null); // stack currently under a dragged element (drag-to-add highlight)
     const [guides, setGuides] = useState([]); 
 
     // Data Fetching
@@ -591,6 +628,13 @@ function UpgradedPageDesigner() {
     // exists in THIS table AND has at least one value selected — otherwise it is
     // ignored (so loading a template whose filter field is from another base, or
     // selecting no values, never hides the entire roster by surprise).
+    // Top-toolbar filter that drives the dynamic title text + per-value export. The
+    // first top filter row with a field chosen designates the field; its typed keyword
+    // (if any) is the live {filter} value.
+    const topFilterRow = filters.find(f => f.fieldId) || null;
+    const topFilterField = (topFilterRow && table) ? table.getFieldByIdIfExists(topFilterRow.fieldId) : null;
+    const topFilterKeyword = (topFilterRow && topFilterRow.keyword) ? topFilterRow.keyword.trim() : '';
+
     const rosterFilterActive = !!(rosterFilter
         && fieldExistsInTable(table, rosterFilter.fieldId)
         && Array.isArray(rosterFilter.values)
@@ -606,8 +650,26 @@ function UpgradedPageDesigner() {
             const names = getFieldValueNames(record, table, rosterFilter.fieldId);
             if (!names.some(n => rosterFilter.values.includes(n))) return false;
         }
+        // Per-value export scopes the roster to one exact value of a chosen field.
+        if (filterValueOverride && filterValueOverride.fieldId) {
+            const names = getFieldValueNames(record, table, filterValueOverride.fieldId);
+            if (!names.includes(filterValueOverride.value)) return false;
+        }
         return true;
     }) : [];
+
+    // Live handle on the current filtered list so the async per-value export loop can
+    // read each value's subset after a re-render without a stale closure.
+    const filteredRecordsRef = useRef(filteredRecords);
+    filteredRecordsRef.current = filteredRecords;
+
+    // Text for a title element's {filter} token: the export override value, else the
+    // live top-filter keyword, else the element's own default.
+    const computeFilterText = (el) => {
+        if (filterValueOverride && filterValueOverride.value) return filterValueOverride.value;
+        if (topFilterKeyword) return topFilterKeyword;
+        return (el && el.filterDefault) || '';
+    };
 
     const currentRecord = filteredRecords[recordIndex];
 
@@ -733,7 +795,21 @@ function UpgradedPageDesigner() {
         if (h.past.length > 60) h.past.shift();
         h.future = [];
         setHistoryTick(t => t + 1);
-        globalConfig.setAsync(elementsKey, newElements);
+        // A too-large value (usually an oversized image) makes globalConfig reject —
+        // and historically that surfaced as a white screen. Catch both the async
+        // rejection and any synchronous throw so a bad write never crashes the editor.
+        try {
+            const p = globalConfig.setAsync(elementsKey, newElements);
+            if (p && typeof p.catch === 'function') {
+                p.catch(err => {
+                    console.warn("Could not save layout (too large?)", err);
+                    alert("Couldn't save that change. The layout may be too large — usually an oversized image. Try a smaller image.");
+                });
+            }
+        } catch (err) {
+            console.warn("Could not save layout (too large?)", err);
+            alert("Couldn't save that change. The layout may be too large — usually an oversized image. Try a smaller image.");
+        }
     };
 
     const undo = () => {
@@ -743,7 +819,7 @@ function UpgradedPageDesigner() {
         h.future.push(JSON.stringify(elements));
         setHistoryTick(t => t + 1);
         globalConfig.setAsync(elementsKey, JSON.parse(prev));
-        setSelectedElementId(null); setSelectedStackChildId(null); setSelectedIds([]);
+        setSelectedElementId(null); setSelectedChildPath([]); setSelectedIds([]);
     };
 
     const redo = () => {
@@ -753,7 +829,7 @@ function UpgradedPageDesigner() {
         h.past.push(JSON.stringify(elements));
         setHistoryTick(t => t + 1);
         globalConfig.setAsync(elementsKey, JSON.parse(next));
-        setSelectedElementId(null); setSelectedStackChildId(null); setSelectedIds([]);
+        setSelectedElementId(null); setSelectedChildPath([]); setSelectedIds([]);
     };
 
     // Keep refs to the latest undo/redo so a once-attached key listener never goes stale.
@@ -817,7 +893,7 @@ function UpgradedPageDesigner() {
         }
         historyRef.current = { past: [], future: [] };
         setHistoryTick(t => t + 1);
-        setSelectedElementId(null); setSelectedStackChildId(null); setSelectedIds([]);
+        setSelectedElementId(null); setSelectedChildPath([]); setSelectedIds([]);
         setDesignMode(mode);
     };
 
@@ -853,9 +929,7 @@ function UpgradedPageDesigner() {
         if (file) {
             const reader = new FileReader();
             reader.onload = (f) => {
-                if(selectedStackChildId) {
-                    updateStackItem(selectedStackChildId, {customIcon: f.target.result});
-                } else if(selectedElementId) {
+                if (selectedElementId) {
                     updateSelected({ customIcon: f.target.result });
                 }
             };
@@ -926,95 +1000,104 @@ function UpgradedPageDesigner() {
         setEditMode('elements');
     };
 
+    const createStackChild = (itemType) => {
+        if (itemType === 'stack') {
+            const s = createLayer('stack');
+            s.width = 200; s.height = 100;
+            s.children = [];
+            return s;
+        }
+        let newItemType = 'field', newItemDisplayMode = 'text';
+        if (itemType === 'static') { newItemType = 'static'; newItemDisplayMode = 'text'; }
+        else if (itemType === 'field') { newItemType = 'field'; newItemDisplayMode = 'text'; }
+        else if (itemType === 'icon') { newItemType = 'field'; newItemDisplayMode = 'icon'; }
+        else if (itemType === 'image') { newItemType = 'field'; newItemDisplayMode = 'image'; }
+        const newItem = createLayer(newItemType);
+        newItem.displayMode = newItemDisplayMode;
+        if (itemType === 'icon') { newItem.width = 40; newItem.height = 40; }
+        else if (itemType === 'image') { newItem.width = 60; newItem.height = 60; }
+        return newItem;
+    };
+
+    // Add an item to the currently-selected stack (root OR a nested stack at the path).
     const addStackItem = (itemType) => {
         if (!selectedElementId) return;
-        const newElements = elements.map(el => {
-            if (el.id === selectedElementId && el.type === 'stack') {
-                // Determine props based on requested type
-                let newItemType = 'field'; // Default base type
-                let newItemDisplayMode = 'text';
-                
-                if (itemType === 'static') {
-                    newItemType = 'static';
-                    newItemDisplayMode = 'text';
-                } else if (itemType === 'field') {
-                    newItemType = 'field';
-                    newItemDisplayMode = 'text';
-                } else if (itemType === 'icon') {
-                    newItemType = 'field';
-                    newItemDisplayMode = 'icon';
-                } else if (itemType === 'image') {
-                    newItemType = 'field';
-                    newItemDisplayMode = 'image';
-                }
-
-                const newItem = createLayer(newItemType);
-                newItem.displayMode = newItemDisplayMode;
-
-                // Sizing overrides
-                if (itemType === 'icon') {
-                    newItem.width = 40;
-                    newItem.height = 40;
-                } else if (itemType === 'image') {
-                    newItem.width = 60;
-                    newItem.height = 60;
-                }
-
-                return { ...el, children: [...(el.children || []), newItem] };
-            }
-            return el;
-        });
+        const root = elements.find(el => el.id === selectedElementId);
+        const target = getChildByPath(root, selectedChildPath);
+        if (!target || target.type !== 'stack') return;
+        const newItem = createStackChild(itemType);
+        const newElements = elements.map(el => el.id === selectedElementId
+            ? updateChildByPath(el, selectedChildPath, (stack) => ({ ...stack, children: [...(stack.children || []), newItem] }))
+            : el);
         updateElements(newElements);
     };
 
-    const removeStackItem = (childId) => {
+    // Remove a child at parentPath's list. parentPath addresses the containing stack.
+    const removeStackItem = (parentPath, childId) => {
         if (!selectedElementId) return;
-        const newElements = elements.map(el => {
-            if (el.id === selectedElementId && el.type === 'stack') {
-                return { ...el, children: (el.children || []).filter(c => c.id !== childId) };
-            }
-            return el;
-        });
+        const newElements = elements.map(el => el.id === selectedElementId
+            ? updateChildByPath(el, parentPath, (parent) => ({ ...parent, children: (parent.children || []).filter(c => c.id !== childId) }))
+            : el);
         updateElements(newElements);
-        if(selectedStackChildId === childId) setSelectedStackChildId(null);
+        // If the selected item was inside what we removed, step selection back up.
+        if (selectedChildPath.length > parentPath.length && selectedChildPath[parentPath.length] === childId) {
+            setSelectedChildPath(parentPath);
+        }
     };
 
-    // Reorder a child within its stack. dir = -1 (toward start) or +1 (toward end).
-    const moveStackItem = (childId, dir) => {
+    // Reorder a child within its parent stack (parentPath). dir = -1 / +1.
+    const moveStackItem = (parentPath, childId, dir) => {
         if (!selectedElementId) return;
-        const newElements = elements.map(el => {
-            if (el.id === selectedElementId && el.type === 'stack') {
-                const children = [...(el.children || [])];
+        const newElements = elements.map(el => el.id === selectedElementId
+            ? updateChildByPath(el, parentPath, (parent) => {
+                const children = [...(parent.children || [])];
                 const i = children.findIndex(c => c.id === childId);
                 const j = i + dir;
-                if (i === -1 || j < 0 || j >= children.length) return el;
+                if (i === -1 || j < 0 || j >= children.length) return parent;
                 [children[i], children[j]] = [children[j], children[i]];
-                return { ...el, children };
-            }
-            return el;
-        });
+                return { ...parent, children };
+            })
+            : el);
         updateElements(newElements);
     };
 
-    const updateStackItem = (childId, updates) => {
-        if (!selectedElementId) return;
-        const newElements = elements.map(el => {
-            if (el.id === selectedElementId && el.type === 'stack') {
-                const newChildren = (el.children || []).map(c => {
-                    if (c.id === childId) {
-                        // If updating style, merge it
-                        if (updates.style) {
-                            return { ...c, style: { ...c.style, ...updates.style } };
-                        }
-                        return { ...c, ...updates };
-                    }
-                    return c;
-                });
-                return { ...el, children: newChildren };
-            }
-            return el;
-        });
+    // Move the currently-selected nested item back out to a top-level element.
+    const popOutOfStack = () => {
+        if (!selectedChildPath.length) return;
+        const root = elements.find(el => el.id === selectedElementId);
+        const node = getChildByPath(root, selectedChildPath);
+        if (!root || !node) return;
+        const popped = { ...node, x: (root.x || 50) + 24, y: (root.y || 50) + 24, width: node.width || 120, height: node.height || 40 };
+        const trimmedRoot = removeChildByPath(root, selectedChildPath);
+        const newElements = elements.map(el => el.id === selectedElementId ? trimmedRoot : el).concat(popped);
         updateElements(newElements);
+        setSelectedElementId(popped.id);
+        setSelectedChildPath([]);
+        setSelectedIds([popped.id]);
+    };
+
+    // Drag-drop reparent: move a top-level element into a stack's items. Dropping a
+    // stack into a stack nests it. x/y are dropped (flex positions them instead).
+    const reparentIntoStack = (elId, stackId) => {
+        const dragged = elements.find(e => e.id === elId);
+        const target = elements.find(e => e.id === stackId);
+        if (!dragged || !target || target.type !== 'stack' || elId === stackId) return;
+        const child = { ...dragged, width: dragged.width || 120, height: dragged.height || 40 };
+        delete child.x; delete child.y;
+        // Grow the target so the dropped item fits (an empty stack is small and would
+        // otherwise clip a larger stack dropped into it — its items wouldn't show).
+        const pad = 16;
+        const grownW = Math.max(target.width || 0, (child.width || 0) + pad);
+        const grownH = Math.max(target.height || 0, (child.height || 0) + pad);
+        const newElements = elements
+            .filter(e => e.id !== elId)
+            .map(e => e.id === stackId
+                ? { ...e, width: grownW, height: grownH, children: [...(e.children || []), child] }
+                : e);
+        updateElements(newElements);
+        setSelectedElementId(stackId);
+        setSelectedChildPath([child.id]);
+        setSelectedIds([stackId]);
     };
 
     const addShape = (shapeType) => {
@@ -1062,6 +1145,28 @@ function UpgradedPageDesigner() {
     // size sane — full-res data URLs can be multiple MB). Encodes as PNG when the
     // element is flagged transparent (or the source file is a PNG and no choice was
     // made yet), so transparent images keep their alpha instead of flattening to black.
+    // Commit an image onto the selected element with a guarded, awaitable write.
+    // Returns true on success, false if globalConfig rejected it (too large) — so the
+    // caller can shrink and retry or surface a clear message instead of crashing.
+    const trySetStaticImage = async (dataUrl, wantPng) => {
+        const id = selectedElementId;
+        if (!id) return false;
+        const newElements = elements.map(el => el.id === id ? { ...el, staticImage: dataUrl, transparentPng: wantPng } : el);
+        const prev = JSON.stringify(elements);
+        try {
+            await globalConfig.setAsync(elementsKey, newElements);
+            const h = historyRef.current;
+            h.past.push(prev);
+            if (h.past.length > 60) h.past.shift();
+            h.future = [];
+            setHistoryTick(t => t + 1);
+            return true;
+        } catch (err) {
+            console.warn("Image write rejected (too large?)", err);
+            return false;
+        }
+    };
+
     const handleStaticImageUpload = (e) => {
         const file = e.target.files[0];
         if (!file) return;
@@ -1072,18 +1177,32 @@ function UpgradedPageDesigner() {
         const reader = new FileReader();
         reader.onload = (f) => {
             const img = new Image();
-            img.onload = () => {
-                const MAX = 1200;
-                let w = img.width, h = img.height;
-                if (w > h) { if (w > MAX) { h = Math.round(h * MAX / w); w = MAX; } }
-                else { if (h > MAX) { w = Math.round(w * MAX / h); h = MAX; } }
-                const c = document.createElement('canvas');
-                c.width = w; c.height = h;
-                c.getContext('2d').drawImage(img, 0, 0, w, h);
-                const dataUrl = wantPng ? c.toDataURL('image/png') : c.toDataURL('image/jpeg', 0.85);
-                updateSelected({ staticImage: dataUrl, transparentPng: wantPng });
+            img.onload = async () => {
+                // Encode at a given max dimension, keeping the chosen format.
+                const encodeAt = (MAX) => {
+                    let w = img.width, h = img.height;
+                    if (w > h) { if (w > MAX) { h = Math.round(h * MAX / w); w = MAX; } }
+                    else { if (h > MAX) { w = Math.round(w * MAX / h); h = MAX; } }
+                    const c = document.createElement('canvas');
+                    c.width = w; c.height = h;
+                    c.getContext('2d').drawImage(img, 0, 0, w, h);
+                    return wantPng ? c.toDataURL('image/png') : c.toDataURL('image/jpeg', 0.85);
+                };
+                // Try progressively smaller versions until globalConfig accepts one.
+                // This both prevents the oversized-write crash and keeps the image as
+                // large as will actually fit.
+                const sizes = [1200, 900, 700, 500];
+                let lastUrl = '';
+                for (const s of sizes) {
+                    lastUrl = encodeAt(s);
+                    if (await trySetStaticImage(lastUrl, wantPng)) return;
+                }
+                alert(
+                    `This image is too large to store (about ${formatBytes(dataUrlBytes(lastUrl))} even after shrinking). ` +
+                    `Use a smaller or lower-resolution image${wantPng ? ', or turn off Transparent (PNG) to store a lighter JPEG.' : '.'}`
+                );
             };
-            img.onerror = () => updateSelected({ staticImage: f.target.result, transparentPng: wantPng });
+            img.onerror = () => alert("Couldn't read that image file. Try a different file.");
             img.src = f.target.result;
         };
         reader.readAsDataURL(file);
@@ -1096,13 +1215,19 @@ function UpgradedPageDesigner() {
     const reencodeStaticImage = (el, toPng) => {
         if (!el || !el.staticImage) { updateSelected({ transparentPng: toPng }); return; }
         const img = new Image();
-        img.onload = () => {
+        img.onload = async () => {
             const c = document.createElement('canvas');
             c.width = img.naturalWidth || img.width;
             c.height = img.naturalHeight || img.height;
             c.getContext('2d').drawImage(img, 0, 0);
             const dataUrl = toPng ? c.toDataURL('image/png') : c.toDataURL('image/jpeg', 0.85);
-            updateSelected({ staticImage: dataUrl, transparentPng: toPng });
+            const ok = await trySetStaticImage(dataUrl, toPng);
+            if (!ok) {
+                alert(
+                    `Switching to ${toPng ? 'PNG' : 'JPEG'} makes this image too large to store (about ${formatBytes(dataUrlBytes(dataUrl))}). ` +
+                    `Keeping the current version. Re-upload a smaller image if you need ${toPng ? 'transparency' : 'this format'}.`
+                );
+            }
         };
         img.onerror = () => updateSelected({ transparentPng: toPng });
         img.src = el.staticImage;
@@ -1159,7 +1284,10 @@ function UpgradedPageDesigner() {
     const genId = () => Date.now().toString() + Math.random().toString(36).substr(2, 5);
 
     const deleteSelected = () => {
-        if (selectedStackChildId) { removeStackItem(selectedStackChildId); return; }
+        if (selectedChildPath.length) {
+            removeStackItem(selectedChildPath.slice(0, -1), selectedChildPath[selectedChildPath.length - 1]);
+            return;
+        }
         if (selectedIds.length === 0) return;
         const ids = new Set(selectedIds);
         updateElements(elements.filter(e => !ids.has(e.id)));
@@ -1169,13 +1297,16 @@ function UpgradedPageDesigner() {
 
     const duplicateSelected = () => {
         if (selectedStackChildId || selectedIds.length === 0) return; // top-level only
+        const regenIds = (node) => {
+            const copy = { ...node, id: genId() };
+            if (Array.isArray(node.children)) copy.children = node.children.map(regenIds);
+            return copy;
+        };
         const ids = new Set(selectedIds);
         const copies = [];
         elements.forEach(e => {
             if (!ids.has(e.id)) return;
-            const copy = JSON.parse(JSON.stringify(e));
-            copy.id = genId();
-            if (Array.isArray(copy.children)) copy.children = copy.children.map(c => ({ ...c, id: genId() }));
+            const copy = regenIds(JSON.parse(JSON.stringify(e)));
             copy.x = (e.x || 0) + 12;
             copy.y = (e.y || 0) + 12;
             copies.push(copy);
@@ -1195,7 +1326,7 @@ function UpgradedPageDesigner() {
 
     const deselectAll = () => {
         setSelectedElementId(null);
-        setSelectedStackChildId(null);
+        setSelectedChildPath([]);
         setSelectedIds([]);
     };
 
@@ -1232,32 +1363,23 @@ function UpgradedPageDesigner() {
     }, []);
 
     const updateSelected = (updates) => {
-        if (selectedStackChildId) {
-            updateStackItem(selectedStackChildId, updates);
-            return;
-        }
         if (!selectedElementId) return;
-        const newElements = elements.map(el => {
-            if (el.id === selectedElementId) {
-                return { ...el, ...updates };
-            }
-            return el;
-        });
+        const applyMerge = (node) => {
+            if (updates.style) return { ...node, ...updates, style: { ...node.style, ...updates.style } };
+            return { ...node, ...updates };
+        };
+        const newElements = elements.map(el => el.id === selectedElementId
+            ? updateChildByPath(el, selectedChildPath, applyMerge)
+            : el);
         updateElements(newElements);
     };
 
     const updateSelectedStyle = (property, value) => {
-        if (selectedStackChildId) {
-            updateStackItem(selectedStackChildId, { style: { [property]: value } });
-            return;
-        }
         if (!selectedElementId) return;
-        const newElements = elements.map(el => {
-            if (el.id === selectedElementId) {
-                return { ...el, style: { ...el.style, [property]: value } };
-            }
-            return el;
-        });
+        const applyStyle = (node) => ({ ...node, style: { ...node.style, [property]: value } });
+        const newElements = elements.map(el => el.id === selectedElementId
+            ? updateChildByPath(el, selectedChildPath, applyStyle)
+            : el);
         updateElements(newElements);
     };
 
@@ -1444,6 +1566,27 @@ function UpgradedPageDesigner() {
         }
     };
 
+    // The top-level stack that best overlaps the dragged element's box, for drag-to-add.
+    // Overlap (not center-in-target) so a large stack dropped onto a small/empty stack
+    // still registers. Requires meaningful coverage so passing over doesn't false-trigger.
+    const findStackDropTarget = (draggedId, box) => {
+        const draggedArea = Math.max(1, (box.w || 0) * (box.h || 0));
+        let best = null, bestRatio = 0;
+        for (const el of elements) {
+            if (el.type !== 'stack' || el.id === draggedId) continue;
+            const ew = el.width || 0, eh = el.height || 0;
+            const ix = Math.max(box.x, el.x);
+            const iy = Math.max(box.y, el.y);
+            const iw = Math.min(box.x + box.w, el.x + ew) - ix;
+            const ih = Math.min(box.y + box.h, el.y + eh) - iy;
+            if (iw <= 0 || ih <= 0) continue;
+            const overlap = iw * ih;
+            const ratio = overlap / Math.min(draggedArea, Math.max(1, ew * eh));
+            if (ratio > bestRatio) { bestRatio = ratio; best = el; }
+        }
+        return bestRatio >= 0.35 ? best : null; // needs ~a third of the smaller box covered
+    };
+
     const handleDrag = (e, data, id) => {
         const g = groupStartRef.current;
         if (g && g.anchorId === id) {
@@ -1455,11 +1598,18 @@ function UpgradedPageDesigner() {
             });
             setGroupDrag(moved);
             setGuides([]); // snapping is per-element; skip it during a group move
+            setDropTargetStackId(null);
             return;
         }
         const { x, y, activeGuides } = calculateSnap(id, data.x, data.y);
         setDraggingState({ id, x, y });
         setGuides(activeGuides);
+        // Live highlight of the stack this would drop into.
+        const dragged = elements.find(el => el.id === id);
+        if (dragged) {
+            const t = findStackDropTarget(id, { x, y, w: dragged.width || 0, h: dragged.height || 0 });
+            setDropTargetStackId(t ? t.id : null);
+        }
     };
 
     const handleDragStop = (e, data, id) => {
@@ -1474,12 +1624,27 @@ function UpgradedPageDesigner() {
             groupStartRef.current = null;
             setGroupDrag(null);
             setGuides([]);
+            setDropTargetStackId(null);
             return;
         }
         const { x, y } = calculateSnap(id, data.x, data.y);
+        // Drag-to-add: if this element's center is dropped over a (different) top-level
+        // stack, move it into that stack's items instead of just repositioning.
+        const dragged = elements.find(el => el.id === id);
+        if (dragged) {
+            const target = findStackDropTarget(id, { x, y, w: dragged.width || 0, h: dragged.height || 0 });
+            if (target) {
+                reparentIntoStack(id, target.id);
+                setDraggingState(null);
+                setGuides([]);
+                setDropTargetStackId(null);
+                return;
+            }
+        }
         updateElementPosition(id, x, y);
         setDraggingState(null);
         setGuides([]);
+        setDropTargetStackId(null);
     };
 
     // --- RESIZE ENGINE ---
@@ -1880,7 +2045,95 @@ function UpgradedPageDesigner() {
         }
     };
 
-    // 6. RENDER HELPERS
+    // Export one PDF per distinct value of the roster-filter field: scopes the roster
+    // (and the title page's {filter} text) to each value in turn, saving a file per
+    // value (Danny.pdf, Will.pdf, ...). Each file gets its own title page + cards.
+    const sanitizeFileName = (s) => (String(s || 'value').replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '_') || 'value');
+
+    const exportPerFilterValue = async () => {
+        if (!pageRef.current) return;
+        if (!topFilterRow || !topFilterField) {
+            alert("Add a filter at the top and pick the field to split by (e.g. Manager(s)). The value box can stay empty.");
+            return;
+        }
+        const fieldId = topFilterRow.fieldId;
+        const distinct = records
+            ? [...new Set(records.flatMap(r => getFieldValueNames(r, table, fieldId)))]
+                .filter(v => v !== '' && v != null).sort()
+            : [];
+        if (distinct.length === 0) { alert("No values found in that field."); return; }
+        if (!confirm(`This exports ${distinct.length} separate PDFs (one per value of ${topFilterField.name}). Your browser may ask permission to download multiple files. Continue?`)) return;
+
+        setIsExporting(true);
+        const savedIndex = recordIndex;
+        const savedFilters = filters;
+        // Clear typed keywords while we run so the override alone defines each subset.
+        setFilters(filters.map(f => ({ ...f, keyword: '' })));
+        try {
+            const rosterPS = { ...DEFAULT_PAGE_STYLE, ...(globalConfig.get('pageStyle') || {}) };
+            const titlePS = { ...DEFAULT_PAGE_STYLE, ...(globalConfig.get('titlePageStyle') || {}) };
+            const includeTitle = !!globalConfig.get('titlePageStyle') && globalConfig.get('titlePageEnabled') !== false;
+            const rosterOrientation = rosterPS.width > rosterPS.height ? 'l' : 'p';
+
+            for (let v = 0; v < distinct.length; v++) {
+                const value = distinct[v];
+                setExportProgress(`Value ${v + 1} of ${distinct.length}: ${value}`);
+
+                // Scope roster + {filter} to this exact value, on the roster render target.
+                setFilterValueOverride({ fieldId, value });
+                setExportMode('roster');
+                await nextFrame(); await nextFrame();
+
+                const subset = filteredRecordsRef.current;
+                if (!subset || subset.length === 0) continue; // nothing matches this value
+
+                await prepareAllRecordsForPrint(subset);
+
+                const firstPS = includeTitle ? titlePS : rosterPS;
+                const firstOrientation = firstPS.width > firstPS.height ? 'l' : 'p';
+                const pdf = new jsPDF({ orientation: firstOrientation, unit: 'px', format: [firstPS.width, firstPS.height], compress: true });
+                let pageCount = 0;
+
+                if (includeTitle) {
+                    setExportMode('title');
+                    await nextFrame(); await nextFrame();
+                    try {
+                        const imgData = await capturePageImage('JPEG', 0.9, BULK_EXPORT_SCALE, titlePS);
+                        pdf.addImage(imgData, 'JPEG', 0, 0, titlePS.width, titlePS.height, undefined, 'FAST');
+                        addPageLinks(pdf, 1);
+                        pageCount = 1;
+                    } catch (err) { console.error("Title page failed for", value, err); }
+                    setExportMode('roster');
+                    await nextFrame(); await nextFrame();
+                }
+
+                for (let i = 0; i < subset.length; i++) {
+                    setExportProgress(`${value}: ${i + 1} of ${subset.length}`);
+                    setRecordIndex(i);
+                    try {
+                        const imgData = await capturePageImage('JPEG', 0.9, BULK_EXPORT_SCALE, rosterPS);
+                        if (pageCount > 0) pdf.addPage([rosterPS.width, rosterPS.height], rosterOrientation);
+                        pdf.addImage(imgData, 'JPEG', 0, 0, rosterPS.width, rosterPS.height, undefined, 'FAST');
+                        addPageLinks(pdf, pageCount + 1);
+                        pageCount++;
+                    } catch (err) { console.error(`Record ${i} failed for ${value}`, err); }
+                }
+
+                if (pageCount > 0) pdf.save(`${sanitizeFileName(value)}.pdf`);
+                await new Promise(res => setTimeout(res, 400)); // space out downloads
+            }
+        } catch (err) {
+            console.error("Per-value export failed:", err);
+            alert("Per-value export failed: " + (err && err.message ? err.message : err));
+        } finally {
+            setExportProgress('');
+            setIsExporting(false);
+            setExportMode(null);
+            setFilterValueOverride(null);
+            setFilters(savedFilters);
+            setRecordIndex(savedIndex);
+        }
+    };
     const getPageBackgroundStyle = () => {
         const activeImageUrl = sessionImage || pageStyle.imageUrl;
         if (pageStyle.type === 'image' && activeImageUrl) {
@@ -1895,6 +2148,77 @@ function UpgradedPageDesigner() {
             return { backgroundColor: pageStyle.color1 };
         }
     };
+
+    // Does this node render anything for the current record? Mirrors the collapse rules
+    // below: a linked field with no value is empty; a nested stack is empty when all of
+    // its descendants are empty. Used so an empty nested stack collapses (and its
+    // siblings reflow) the same way an empty field does.
+    const nodeHasContent = (node) => {
+        if (!node) return false;
+        if (node.type === 'stack') return (node.children || []).some(nodeHasContent);
+        if (node.fieldId && currentRecord) return !!safeGetCellValueAsString(currentRecord, table, node.fieldId);
+        if (node.type === 'static' && node.displayMode === 'text' && !node.useFilterValue) {
+            return !!(node.text && node.text.trim().length);
+        }
+        return true; // static images/icons/shapes, filter-value text, or field without a record
+    };
+
+    // Recursively render a stack's items on the canvas. Stacks can contain stacks, so
+    // each child is addressed by a PATH (basePath + child.id) for selection/highlight.
+    const renderStackNode = (stack, rootId, basePath) => (
+        <div style={{
+            width: '100%', height: '100%', display: 'flex',
+            flexDirection: stack.stackDirection,
+            justifyContent: stack.stackAlign,
+            alignItems: 'center',
+            gap: `${stack.stackSpacing}px`,
+            padding: '5px',
+            flexWrap: 'wrap',
+            overflow: 'hidden'
+        }}>
+            {(stack.children || []).map(child => {
+                // Collapse linked fields that are empty/missing for this record.
+                if (child.fieldId && currentRecord) {
+                    const val = safeGetCellValueAsString(currentRecord, table, child.fieldId);
+                    if (!val) return null;
+                }
+                // Collapse a nested stack that has nothing to show, so its siblings
+                // reflow (e.g. an empty "Notable Works" lets "Managers" slide to Start).
+                if (child.type === 'stack' && !nodeHasContent(child)) return null;
+                const childPath = [...basePath, child.id];
+                const isChildSelected = !isExporting && selectedElementId === rootId && pathsEqual(selectedChildPath, childPath);
+                const inner = child.type === 'stack'
+                    ? renderStackNode(child, rootId, childPath)
+                    : renderElementContent(child);
+                return (
+                    <div
+                        key={child.id}
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedElementId(rootId);
+                            setSelectedChildPath(childPath);
+                            setSelectedIds([rootId]);
+                            setEditMode('elements');
+                        }}
+                        style={{
+                            ...child.style,
+                            width: `${child.width}px`,
+                            height: `${child.height}px`,
+                            flexShrink: 0,
+                            position: 'relative',
+                            border: isChildSelected
+                                ? '2px solid #fa243c'
+                                : (child.style.borderWidth && child.style.borderWidth !== '0px'
+                                    ? `${child.style.borderWidth} ${child.style.borderStyle} ${child.style.borderColor}` : 'none'),
+                            cursor: 'pointer'
+                        }}
+                    >
+                        {inner}
+                    </div>
+                );
+            })}
+        </div>
+    );
 
     // Shared visual rendering for both Root Elements and Stack Children
     const renderElementContent = (el) => {
@@ -1912,6 +2236,14 @@ function UpgradedPageDesigner() {
                     // FIX: Use safe wrapper — fieldId may be from a different base
                     textVal = safeGetCellValueAsString(currentRecord, table, el.fieldId);
                 }
+            }
+            // Roster-filter-driven text: shows the top filter's value (or this element's
+            // default when nothing is filtered), with an optional static suffix appended
+            // — so "Danny" + "Roster" renders "Danny Roster". Overrides the element text.
+            if (el.useFilterValue) {
+                const base = computeFilterText(el);
+                const suffix = el.filterSuffix || '';
+                textVal = [base, suffix].filter(s => s !== '' && s != null).join(' ');
             }
             // Per-element find/replace (supports \n -> line break), applied live to
             // whatever this display renders, for every record.
@@ -2030,9 +2362,10 @@ function UpgradedPageDesigner() {
         return null;
     };
 
-    const activeElement = selectedStackChildId 
-        ? elements.find(e => e.id === selectedElementId)?.children?.find(c => c.id === selectedStackChildId) 
-        : elements.find(e => e.id === selectedElementId);
+    const selectedRootElement = elements.find(e => e.id === selectedElementId);
+    const activeElement = selectedRootElement
+        ? getChildByPath(selectedRootElement, selectedChildPath)
+        : null;
 
     // 7. MAIN UI
     return (
@@ -2329,60 +2662,65 @@ function UpgradedPageDesigner() {
                         </>
                     )}
 
-                    {editMode === 'elements' && selectedElementId && selectedIds.length < 2 && (
+                    {editMode === 'elements' && selectedElementId && selectedIds.length < 2 && activeElement && (
                         <>
                             <Box display="flex" justifyContent="space-between" alignItems="center" marginBottom={3}>
-                                <Heading size="xsmall">Edit {selectedStackChildId ? 'Stack Item' : 'Element'}</Heading>
+                                <Heading size="xsmall">Edit {selectedChildPath.length ? (activeElement.type === 'stack' ? 'Nested Stack' : 'Item') : 'Element'}</Heading>
                                 <Box display="flex" gap={1}>
-                                    {!selectedStackChildId && (
+                                    {selectedChildPath.length === 0 && (
                                         <Button size="small" variant="default" icon="duplicate" onClick={duplicateSelected}>Duplicate</Button>
                                     )}
                                     <Button size="small" variant="danger" onClick={() => {
-                                        if(selectedStackChildId) {
-                                            removeStackItem(selectedStackChildId);
+                                        if (selectedChildPath.length) {
+                                            removeStackItem(selectedChildPath.slice(0, -1), selectedChildPath[selectedChildPath.length - 1]);
                                         } else {
                                             deleteElement(selectedElementId);
                                         }
                                     }}>Delete</Button>
                                 </Box>
                             </Box>
-                            
-                            {selectedStackChildId && (
-                                <Button marginBottom={3} onClick={() => setSelectedStackChildId(null)} icon="chevronLeft">
-                                    Back to Stack
-                                </Button>
+
+                            {selectedChildPath.length > 0 && (
+                                <Box display="flex" gap={1} marginBottom={3}>
+                                    <Button flex="1" size="small" icon="chevronLeft" onClick={() => setSelectedChildPath(selectedChildPath.slice(0, -1))}>
+                                        Back
+                                    </Button>
+                                    <Button flex="1" size="small" variant="default" icon="expand" onClick={popOutOfStack}>
+                                        Pop out
+                                    </Button>
+                                </Box>
                             )}
 
-                            {/* --- STACK CONTAINER EDITOR (Only visible if no child selected) --- */}
-                            {elements.find(e => e.id === selectedElementId)?.type === 'stack' && !selectedStackChildId && (
+                            {/* --- STACK EDITOR — shows for the active stack, root OR nested --- */}
+                            {activeElement.type === 'stack' && (
                                 <Box marginBottom={3}>
                                     <Label>Stack Layout</Label>
                                     <Box display="flex" gap={1} marginBottom={2}>
-                                        <Select 
+                                        <Select
                                             options={[
                                                 {value: 'row', label: 'Horizontal Row'},
                                                 {value: 'column', label: 'Vertical Column'}
                                             ]}
-                                            value={elements.find(e => e.id === selectedElementId).stackDirection}
+                                            value={activeElement.stackDirection}
                                             onChange={val => updateSelected({stackDirection: val})}
                                         />
                                     </Box>
                                     <Label>Spacing (px)</Label>
-                                    <Input 
+                                    <Input
                                         type="number"
-                                        value={elements.find(e => e.id === selectedElementId).stackSpacing}
+                                        value={activeElement.stackSpacing}
                                         onChange={e => updateSelected({stackSpacing: parseInt(e.target.value) || 0})}
                                         marginBottom={2}
                                     />
                                     <Label>Alignment</Label>
-                                    <Select 
+                                    <Select
                                         options={[
                                             {value: 'flex-start', label: 'Start'},
                                             {value: 'center', label: 'Center'},
                                             {value: 'flex-end', label: 'End'},
                                             {value: 'space-between', label: 'Space Between'}
                                         ]}
-                                        value={elements.find(e => e.id === selectedElementId).stackAlign}
+                                        value={activeElement.stackAlign}
                                         onChange={val => updateSelected({stackAlign: val})}
                                     />
 
@@ -2394,21 +2732,22 @@ function UpgradedPageDesigner() {
                                     <Box display="flex" gap={1} marginBottom={2}>
                                         <Button flex="1" size="small" onClick={() => addStackItem('field')}>+ Field</Button>
                                         <Button flex="1" size="small" onClick={() => addStackItem('static')}>+ Text</Button>
+                                        <Button flex="1" size="small" onClick={() => addStackItem('stack')}>+ Stack</Button>
                                     </Box>
-                                    
-                                    {(elements.find(e => e.id === selectedElementId).children || []).map((child, idx) => (
-                                        <Box 
-                                            key={child.id} 
-                                            padding={2} 
-                                            border="default" 
-                                            marginBottom={2} 
-                                            borderRadius="default" 
+
+                                    {(activeElement.children || []).map((child, idx) => (
+                                        <Box
+                                            key={child.id}
+                                            padding={2}
+                                            border="default"
+                                            marginBottom={2}
+                                            borderRadius="default"
                                             backgroundColor="white"
-                                            style={{cursor: 'pointer', borderLeft: '4px solid #2d7ff9'}}
-                                            onClick={() => setSelectedStackChildId(child.id)}
+                                            style={{cursor: 'pointer', borderLeft: child.type === 'stack' ? '4px solid #f5a623' : '4px solid #2d7ff9'}}
+                                            onClick={() => setSelectedChildPath([...selectedChildPath, child.id])}
                                         >
                                             <Box display="flex" justifyContent="space-between" alignItems="center">
-                                                <Text fontWeight="bold">Item {idx + 1}: {child.displayMode || child.type}</Text>
+                                                <Text fontWeight="bold">Item {idx + 1}: {child.type === 'stack' ? 'Nested Stack' : (child.displayMode || child.type)}</Text>
                                                 <Box display="flex" alignItems="center" gap={1}>
                                                     <Button
                                                         size="small"
@@ -2416,21 +2755,21 @@ function UpgradedPageDesigner() {
                                                         icon="chevronUp"
                                                         aria-label="Move up"
                                                         disabled={idx === 0}
-                                                        onClick={(e) => { e.stopPropagation(); moveStackItem(child.id, -1); }}
+                                                        onClick={(e) => { e.stopPropagation(); moveStackItem(selectedChildPath, child.id, -1); }}
                                                     />
                                                     <Button
                                                         size="small"
                                                         variant="default"
                                                         icon="chevronDown"
                                                         aria-label="Move down"
-                                                        disabled={idx === ((elements.find(e => e.id === selectedElementId).children || []).length - 1)}
-                                                        onClick={(e) => { e.stopPropagation(); moveStackItem(child.id, 1); }}
+                                                        disabled={idx === ((activeElement.children || []).length - 1)}
+                                                        onClick={(e) => { e.stopPropagation(); moveStackItem(selectedChildPath, child.id, 1); }}
                                                     />
-                                                    <Icon name="edit" size={12} />
+                                                    <Icon name={child.type === 'stack' ? 'chevronRight' : 'edit'} size={12} />
                                                 </Box>
                                             </Box>
                                             <Text size="xsmall" textColor="light" truncate>
-                                                {child.fieldId ? 'Linked Field' : child.text || 'Element'}
+                                                {child.type === 'stack' ? `${(child.children || []).length} item(s)` : (child.fieldId ? 'Linked Field' : child.text || 'Element')}
                                             </Text>
                                         </Box>
                                     ))}
@@ -2670,6 +3009,38 @@ function UpgradedPageDesigner() {
 
                                     {(activeElement.type === 'static' || (activeElement.type === 'field' && activeElement.displayMode === 'text')) && (
                                         <Box marginTop={2} padding={2} border="default" borderRadius="default" backgroundColor="white">
+                                            <Box display="flex" alignItems="center">
+                                                <Switch value={activeElement.useFilterValue || false} onChange={val => updateSelected({ useFilterValue: val })} marginRight={2} />
+                                                <Text size="small" style={{ fontWeight: 600 }}>Insert filter value</Text>
+                                            </Box>
+                                            {activeElement.useFilterValue && (
+                                                <Box marginTop={2}>
+                                                    <Text size="xsmall" textColor="light" marginBottom={2}>
+                                                        {`Shows the value from the top filter${topFilterField ? ` on ${topFilterField.name}` : ' (set a field in the top filter)'}, then the appended text — e.g. "Danny" + "Roster" = "Danny Roster". The element's own text is ignored while this is on.`}
+                                                    </Text>
+                                                    <Text size="small" marginBottom={1}>Default (when empty / nothing selected)</Text>
+                                                    <Input
+                                                        size="small"
+                                                        width="100%"
+                                                        placeholder="e.g. Hallwood"
+                                                        value={activeElement.filterDefault || ''}
+                                                        onChange={e => updateSelected({ filterDefault: e.target.value })}
+                                                    />
+                                                    <Text size="small" marginTop={2} marginBottom={1}>Append after value</Text>
+                                                    <Input
+                                                        size="small"
+                                                        width="100%"
+                                                        placeholder="e.g. Roster"
+                                                        value={activeElement.filterSuffix || ''}
+                                                        onChange={e => updateSelected({ filterSuffix: e.target.value })}
+                                                    />
+                                                </Box>
+                                            )}
+                                        </Box>
+                                    )}
+
+                                    {(activeElement.type === 'static' || (activeElement.type === 'field' && activeElement.displayMode === 'text')) && (
+                                        <Box marginTop={2} padding={2} border="default" borderRadius="default" backgroundColor="white">
                                             <Box display="flex" justifyContent="space-between" alignItems="center" marginBottom={1}>
                                                 <Text size="small" style={{ fontWeight: 600 }}>Find &amp; Replace</Text>
                                                 <Button
@@ -2748,12 +3119,27 @@ function UpgradedPageDesigner() {
                                         />
                                     </Box>
 
+                                    {/* Text alignment inside the box (left/center/right) — any text node, incl. nested */}
+                                    {(activeElement.type === 'static' || (activeElement.type === 'field' && activeElement.displayMode === 'text')) && (
+                                        <Box marginTop={2}>
+                                            <Text size="xsmall" textColor="light" marginBottom={1}>Text align</Text>
+                                            <Box display="flex" gap={1}>
+                                                <Button size="small" variant={(!activeElement.style.textAlign || activeElement.style.textAlign === 'left') ? 'primary' : 'default'} onClick={() => updateSelectedStyle('textAlign', 'left')}>Left</Button>
+                                                <Button size="small" variant={activeElement.style.textAlign === 'center' ? 'primary' : 'default'} onClick={() => updateSelectedStyle('textAlign', 'center')}>Center</Button>
+                                                <Button size="small" variant={activeElement.style.textAlign === 'right' ? 'primary' : 'default'} onClick={() => updateSelectedStyle('textAlign', 'right')}>Right</Button>
+                                            </Box>
+                                        </Box>
+                                    )}
+
                                     {/* Only show alignment if it's a root element, stack children align via flex */}
                                     {!selectedStackChildId && (
-                                        <Box marginTop={2} display="flex" gap={2}>
-                                            <Button size="small" onClick={() => handleAlign('left')}>Left</Button>
-                                            <Button size="small" onClick={() => handleAlign('center')}>Center</Button>
-                                            <Button size="small" onClick={() => handleAlign('right')}>Right</Button>
+                                        <Box marginTop={2}>
+                                            <Text size="xsmall" textColor="light" marginBottom={1}>Position on page</Text>
+                                            <Box display="flex" gap={2}>
+                                                <Button size="small" onClick={() => handleAlign('left')}>Left</Button>
+                                                <Button size="small" onClick={() => handleAlign('center')}>Center</Button>
+                                                <Button size="small" onClick={() => handleAlign('right')}>Right</Button>
+                                            </Box>
                                         </Box>
                                     )}
                                     
@@ -2876,6 +3262,17 @@ function UpgradedPageDesigner() {
                             {filters.length > 0 && (
                                 <Button size="small" variant="secondary" onClick={clearAllFilters}>Clear All</Button>
                             )}
+                            {topFilterField && (
+                                <Button
+                                    size="small"
+                                    variant="default"
+                                    icon="download"
+                                    disabled={isExporting}
+                                    onClick={exportPerFilterValue}
+                                >
+                                    Export per {topFilterField.name} value
+                                </Button>
+                            )}
                         </Box>
                     </Box>
 
@@ -2945,7 +3342,7 @@ function UpgradedPageDesigner() {
                     <div 
                         ref={pageRef}
                         id="print-container"
-                        onClick={() => { setSelectedElementId(null); setSelectedStackChildId(null); setSelectedIds([]); }}
+                        onClick={() => { setSelectedElementId(null); setSelectedChildPath([]); setSelectedIds([]); }}
                         style={{
                             ...getPageBackgroundStyle(),
                             width: pageStyle.width,
@@ -2978,6 +3375,7 @@ function UpgradedPageDesigner() {
                         {elements.map(el => {
                             const isSelected = selectedIds.includes(el.id) && !selectedStackChildId && !isExporting;
                             const isPrimary = selectedElementId === el.id;
+                            const isDropTarget = dropTargetStackId === el.id && !isExporting;
                             const isDragging = draggingState && draggingState.id === el.id;
                             const gdPos = groupDrag && groupDrag[el.id];
                             const visualX = gdPos ? gdPos.x : (isDragging ? draggingState.x : el.x);
@@ -2989,54 +3387,9 @@ function UpgradedPageDesigner() {
                             // --- CONTENT RENDERING LOGIC ---
                             let content = null;
                             
-                            // 1. STACKS (Dynamic Row/Col)
+                            // 1. STACKS (Dynamic Row/Col) — recursive so stacks can nest.
                             if (el.type === 'stack') {
-                                content = (
-                                    <div style={{
-                                        width: '100%', 
-                                        height: '100%', 
-                                        display: 'flex',
-                                        flexDirection: el.stackDirection,
-                                        justifyContent: el.stackAlign,
-                                        alignItems: 'center',
-                                        gap: `${el.stackSpacing}px`,
-                                        padding: '5px', // Inner padding
-                                        flexWrap: 'wrap', // FIX: Allow wrap to prevent squish
-                                        overflow: 'hidden' // Clip children
-                                    }}>
-                                        {(el.children || []).map(child => {
-                                            // Check emptiness — FIX: use safe wrapper to avoid crash on stale fieldIds
-                                            let val = null;
-                                            if (child.fieldId && currentRecord) {
-                                                val = safeGetCellValueAsString(currentRecord, table, child.fieldId);
-                                            }
-                                            // If field is linked but empty (or missing), render nothing (collapse)
-                                            if (child.fieldId && !val) return null;
-                                            
-                                            // REUSE RENDER LOGIC
-                                            const childContent = renderElementContent(child);
-                                            const isChildSelected = selectedStackChildId === child.id && !isExporting;
-
-                                            return (
-                                                <div 
-                                                    key={child.id}
-                                                    onClick={(e) => { e.stopPropagation(); setSelectedStackChildId(child.id); setSelectedElementId(el.id); }}
-                                                    style={{
-                                                        ...child.style,
-                                                        width: `${child.width}px`,
-                                                        height: `${child.height}px`,
-                                                        flexShrink: 0,
-                                                        position: 'relative',
-                                                        border: isChildSelected ? '2px solid #fa243c' : child.style.borderWidth ? `${child.style.borderWidth} ${child.style.borderStyle} ${child.style.borderColor}` : 'none',
-                                                        cursor: 'pointer'
-                                                    }}
-                                                >
-                                                    {childContent}
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-                                );
+                                content = renderStackNode(el, el.id, []);
                             } else {
                                 content = renderElementContent(el);
                             }
@@ -3069,14 +3422,15 @@ function UpgradedPageDesigner() {
                                             // 1px line stays 1px instead of being inflated by a 1px border.
                                             border: (el.style.borderWidth && el.style.borderWidth !== '0px')
                                                 ? `${el.style.borderWidth} ${el.style.borderStyle} ${el.style.borderColor}` : 'none',
-                                            outline: isSelected ? (isPrimary ? '1px dashed #2d7ff9' : '1px dashed #9ec5fe') : 'none',
+                                            outline: isDropTarget ? '2px solid #17a34a' : (isSelected ? (isPrimary ? '1px dashed #2d7ff9' : '1px dashed #9ec5fe') : 'none'),
                                             outlineOffset: '1px',
+                                            boxShadow: isDropTarget ? 'inset 0 0 0 9999px rgba(23,163,74,0.12)' : undefined,
                                             boxSizing: 'border-box',
                                             transform: 'translateZ(0)',
                                         }}
                                         onClick={(e) => { 
                                             e.stopPropagation(); 
-                                            setSelectedStackChildId(null); 
+                                            setSelectedChildPath([]); 
                                             setEditMode('elements'); 
                                             const additive = e.shiftKey || e.metaKey || e.ctrlKey;
                                             if (additive) {
